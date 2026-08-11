@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ظ¾ظ†ظ„ ظ…ط¯غŒط±غŒطھ ظ…غŒط±ط²ط§ط®ط§ظ†</title>
+<style>
+  body{ font-family:Tahoma, sans-serif; background:#10141f; color:#eee; margin:0; }
+  header{ background:#1a2030; padding:16px 20px; display:flex; justify-content:space-between; align-items:center; border-bottom:2px solid #d4a94b;}
+  header h1{ font-size:18px; color:#e8cd8a; margin:0;}
+  main{ max-width:900px; margin:0 auto; padding:20px;}
+  .card{ background:#1a2030; border:1px solid #2c3e66; border-radius:12px; padding:16px; margin-bottom:16px;}
+  .stat-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px;}
+  .stat{ background:#141b2e; border-radius:10px; padding:12px; text-align:center;}
+  .stat b{ display:block; font-size:20px; color:#d4a94b;}
+  table{ width:100%; border-collapse:collapse; font-size:13px;}
+  th,td{ padding:8px; text-align:right; border-bottom:1px solid #2c3e66;}
+  th{ color:#e8cd8a;}
+  button{ background:#d4a94b; border:none; padding:6px 10px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:12px;}
+  button.danger{ background:#c1443d; color:#fff;}
+  input{ background:#141b2e; border:1px solid #2c3e66; color:#eee; padding:10px; border-radius:8px; width:100%; margin-bottom:8px; box-sizing:border-box;}
+  #loginBox{ max-width:320px; margin:80px auto; text-align:center;}
+  .tag{ font-size:11px; padding:2px 7px; border-radius:999px; background:#2c3e66;}
+  .tag.banned{ background:#c1443d;}
+  .hide{ display:none;}
+</style>
+</head>
+<body>
+
+<div id="loginBox" class="card">
+  <h2>ظˆط±ظˆط¯ ط§ط¯ظ…غŒظ†</h2>
+  <input id="adminUser" placeholder="ظ†ط§ظ… ع©ط§ط±ط¨ط±غŒ ط§ط¯ظ…غŒظ†">
+  <input id="adminPass" type="password" placeholder="ط±ظ…ط² ط¹ط¨ظˆط±">
+  <button style="width:100%;padding:12px;" onclick="adminLogin()">ظˆط±ظˆط¯</button>
+  <p id="loginErr" style="color:#c1443d;font-size:12px;"></p>
+</div>
+
+<div id="panel" class="hide">
+<header>
+  <h1>ًں–‹ï¸ڈ ظ¾ظ†ظ„ ظ…ط¯غŒط±غŒطھ ظ…غŒط±ط²ط§ط®ط§ظ†</h1>
+  <button onclick="logout()">ط®ط±ظˆط¬</button>
+</header>
+<main>
+  <div class="card">
+    <h3>ط¢ظ…ط§ط± ع©ظ„غŒ</h3>
+    <div class="stat-grid" id="statsGrid"></div>
+  </div>
+
+  <div class="card">
+    <h3>ظ„غŒط³طھ ط¨ط§ط²غŒع©ظ†ط§ظ†</h3>
+    <table>
+      <thead><tr><th>#</th><th>ظ†ط§ظ… ع©ط§ط±ط¨ط±غŒ</th><th>ط³ط·ط­</th><th>ط³ع©ظ‡</th><th>ظ…ط±ط§ط­ظ„</th><th>ظˆط¶ط¹غŒطھ</th><th>ط¹ظ…ظ„غŒط§طھ</th></tr></thead>
+      <tbody id="playersBody"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>ع¯ط²ط§ط±ط´â€Œظ‡ط§</h3>
+    <table>
+      <thead><tr><th>#</th><th>ع¯ط²ط§ط±ط´â€Œط¯ظ‡ظ†ط¯ظ‡</th><th>ط¯ظ„غŒظ„</th><th>ظˆط¶ط¹غŒطھ</th><th>ط¹ظ…ظ„غŒط§طھ</th></tr></thead>
+      <tbody id="reportsBody"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>ع¯ط²ط§ط±ط´ ط¹ظ…ظ„ع©ط±ط¯ ط§ط¯ظ…غŒظ†â€Œظ‡ط§ (Audit Log)</h3>
+    <table>
+      <thead><tr><th>ط²ظ…ط§ظ†</th><th>ط§ط¯ظ…غŒظ†</th><th>ط¹ظ…ظ„غŒط§طھ</th><th>ط¬ط²ط¦غŒط§طھ</th></tr></thead>
+      <tbody id="auditBody"></tbody>
+    </table>
+  </div>
+</main>
+</div>
+
+<script>
+const API = ''; // same origin as this admin page
+let token = localStorage.getItem('__unused'); // placeholder, real token kept in memory only
+let adminToken = null;
+
+async function adminLogin(){
+  const username = document.getElementById('adminUser').value;
+  const password = document.getElementById('adminPass').value;
+  const res = await fetch(API + '/api/admin/login', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username, password})
+  });
+  const data = await res.json();
+  if(!res.ok){ document.getElementById('loginErr').textContent = data.error; return; }
+  adminToken = data.token;
+  document.getElementById('loginBox').classList.add('hide');
+  document.getElementById('panel').classList.remove('hide');
+  loadAll();
+}
+
+function logout(){
+  adminToken = null;
+  document.getElementById('panel').classList.add('hide');
+  document.getElementById('loginBox').classList.remove('hide');
+}
+
+async function authFetch(url, opts={}){
+  opts.headers = Object.assign({}, opts.headers, { 'Authorization': 'Bearer ' + adminToken, 'Content-Type':'application/json' });
+  return fetch(API + url, opts);
+}
+
+async function loadAll(){
+  const stats = await (await authFetch('/api/admin/stats')).json();
+  document.getElementById('statsGrid').innerHTML = `
+    <div class="stat"><b>${stats.totalPlayers}</b>ط¨ط§ط²غŒع©ظ†ط§ظ†</div>
+    <div class="stat"><b>${stats.bannedPlayers}</b>ظ…ط³ط¯ظˆط¯ ط´ط¯ظ‡</div>
+    <div class="stat"><b>${stats.totalStagesCompleted}</b>ظ…ط±ط§ط­ظ„ طھع©ظ…غŒظ„â€Œط´ط¯ظ‡</div>
+    <div class="stat"><b>${stats.totalCoinsInEconomy}</b>ط³ع©ظ‡ ط¯ط± ع¯ط±ط¯ط´</div>
+    <div class="stat"><b>${stats.chatMessages}</b>ظ¾غŒط§ظ… ع†طھ</div>
+    <div class="stat"><b>${stats.openReports}</b>ع¯ط²ط§ط±ط´ ط¨ط§ط²</div>
+  `;
+
+  const players = (await (await authFetch('/api/admin/players')).json()).players;
+  document.getElementById('playersBody').innerHTML = players.map(p => `
+    <tr>
+      <td>${p.id}</td><td>${p.username}</td><td>${p.level}</td><td>${p.coins}</td>
+      <td>${p.completedStages.length}</td>
+      <td><span class="tag ${p.banned?'banned':''}">${p.banned?'ظ…ط³ط¯ظˆط¯':'ظپط¹ط§ظ„'}</span></td>
+      <td>
+        <button onclick="adjustCoins(${p.id})">+/- ط³ع©ظ‡</button>
+        <button class="danger" onclick="toggleBan(${p.id}, ${!p.banned})">${p.banned?'ط±ظپط¹ ظ…ط³ط¯ظˆط¯غŒ':'ظ…ط³ط¯ظˆط¯ ع©ط±ط¯ظ†'}</button>
+      </td>
+    </tr>
+  `).join('');
+
+  const reports = (await (await authFetch('/api/admin/reports')).json()).reports;
+  document.getElementById('reportsBody').innerHTML = reports.map(r => `
+    <tr>
+      <td>${r.id}</td><td>${r.reporterId}</td><td>${r.reason}</td><td>${r.status}</td>
+      <td>${r.status!=='resolved' ? `<button onclick="resolveReport(${r.id})">ط±ظپط¹ ط´ط¯</button>` : 'â€”'}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="5">ع¯ط²ط§ط±ط´غŒ ظˆط¬ظˆط¯ ظ†ط¯ط§ط±ط¯</td></tr>';
+
+  const log = (await (await authFetch('/api/admin/audit-log')).json()).log;
+  document.getElementById('auditBody').innerHTML = log.map(l => `
+    <tr><td>${new Date(l.createdAt).toLocaleString('fa-IR')}</td><td>${l.actor}</td><td>${l.action}</td><td>${l.detail}</td></tr>
+  `).join('') || '<tr><td colspan="4">ع†غŒط²غŒ ط«ط¨طھ ظ†ط´ط¯ظ‡</td></tr>';
+}
+
+async function toggleBan(id, banned){
+  await authFetch(`/api/admin/players/${id}/ban`, { method:'POST', body: JSON.stringify({banned}) });
+  loadAll();
+}
+async function adjustCoins(id){
+  const delta = prompt('ع†ظ†ط¯ ط³ع©ظ‡ ط§ط¶ط§ظپظ‡/ع©ظ… ط¨ط´ظ‡طں (ظ…ط«ظ„ط§ظ‹ 50 غŒط§ -20)');
+  if(delta === null) return;
+  await authFetch(`/api/admin/players/${id}/coins`, { method:'POST', body: JSON.stringify({delta: parseInt(delta)}) });
+  loadAll();
+}
+async function resolveReport(id){
+  await authFetch(`/api/admin/reports/${id}/resolve`, { method:'POST' });
+  loadAll();
+}
+</script>
+</body>
+</html>
