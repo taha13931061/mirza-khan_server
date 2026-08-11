@@ -1,0 +1,20 @@
+{
+  "name": "mirza-khan-server",
+  "version": "1.0.0",
+  "description": "Backend server for the Mirza Khan Persian word game — auth, coins/XP, stages, admin panel, chat, and online battle.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "jsonwebtoken": "^9.0.2",
+    "bcryptjs": "^2.4.3",
+    "socket.io": "^4.7.5",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
