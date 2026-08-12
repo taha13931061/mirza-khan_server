@@ -12,7 +12,8 @@
     "jsonwebtoken": "^9.0.2",
     "bcryptjs": "^2.4.3",
     "socket.io": "^4.7.5",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "@supabase/supabase-js": "^2.45.4"
   },
   "engines": {
     "node": ">=18"
