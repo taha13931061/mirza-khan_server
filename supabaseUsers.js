@@ -24,6 +24,7 @@ function fromRow(row) {
   if (!row) return null;
   return {
     id: row.id,
+    customId: row.custom_id || null,
     username: row.username,
     passwordHash: row.password_hash,
     coins: row.coins,
@@ -74,6 +75,8 @@ async function updateUser(id, patch) {
   if ('hintsUsed' in patch) row.hints_used = patch.hintsUsed;
   if ('wordsFound' in patch) row.words_found = patch.wordsFound;
   if ('banned' in patch) row.banned = patch.banned;
+  if ('customId' in patch) row.custom_id = patch.customId;
+  if ('role' in patch) row.role = patch.role;
   const { data, error } = await getClient().from('users').update(row).eq('id', id).select().single();
   if (error) throw error;
   return fromRow(data);

@@ -19,8 +19,8 @@ app.use(express.json());
 app.use(express.static('public'));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_THIS_SECRET_BEFORE_REAL_USE';
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-this-admin-password';
+// (Old hardcoded ADMIN_USERNAME/ADMIN_PASSWORD env vars are no longer used —
+// admin access is now a real 'owner'/'moderator' role on a real account.)
 
 function signUserToken(user) {
   return jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
@@ -34,7 +34,8 @@ function authRequired(req, res, next) {
 }
 function adminRequired(req, res, next) {
   authRequired(req, res, () => {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'دسترسی ادمین لازم است' });
+    const ok = ['owner', 'moderator', 'creator'].includes(req.user.role);
+    if (!ok) return res.status(403).json({ error: 'دسترسی پنل مدیریت لازم است' });
     next();
   });
 }
@@ -45,7 +46,7 @@ function logAudit(actor, action, detail) {
 }
 function publicUser(u) {
   return {
-    id: u.id, username: u.username, coins: u.coins, xp: u.xp, level: u.level,
+    id: u.id, customId: u.customId || null, username: u.username, coins: u.coins, xp: u.xp, level: u.level,
     unlockedStage: u.unlockedStage, completedStages: u.completedStages, stageProgress: u.stageProgress,
     hintsUsed: u.hintsUsed, wordsFound: u.wordsFound, role: u.role, banned: u.banned
   };
@@ -86,6 +87,7 @@ app.get('/api/me', authRequired, async (req, res) => {
   try {
     const user = await users.findById(req.user.id);
     if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    if (user.banned) return res.status(403).json({ error: 'حساب شما مسدود شده است', banned: true });
     res.json({ user: publicUser(user) });
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
@@ -100,7 +102,9 @@ app.get('/api/stage/:id/play', authRequired, async (req, res) => {
   try {
     const user = await users.findById(req.user.id);
     if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
-    if (stage.id > user.unlockedStage) return res.status(403).json({ error: 'این مرحله هنوز باز نشده' });
+    if (user.banned) return res.status(403).json({ error: 'حساب شما مسدود شده است', banned: true });
+    const canBypassLock = ['tester', 'owner', 'creator', 'moderator'].includes(user.role);
+    if (!canBypassLock && stage.id > user.unlockedStage) return res.status(403).json({ error: 'این مرحله هنوز باز نشده' });
     const progress = (user.stageProgress && user.stageProgress[stage.id]) || [];
     res.json({
       id: stage.id, name: stage.name, letters: stage.letters, char: stage.char,
@@ -117,6 +121,7 @@ app.post('/api/stage/:id/check', authRequired, async (req, res) => {
   try {
     const user = await users.findById(req.user.id);
     if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    if (user.banned) return res.status(403).json({ error: 'حساب شما مسدود شده است', banned: true });
 
     const isValidWord = stage.words.includes(word);
     const progress = new Set((user.stageProgress && user.stageProgress[stage.id]) || []);
@@ -150,14 +155,49 @@ app.post('/api/stage/:id/check', authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
-app.post('/api/stage/hint', authRequired, async (req, res) => {
-  const cost = 15;
+// Skip the current stage: costs coins, does NOT count as completed (no reward),
+// but unlocks the next stage so the player isn't stuck.
+app.post('/api/stage/skip', authRequired, async (req, res) => {
+  const cost = 30;
+  const stageId = parseInt((req.body && req.body.stageId) || 0);
+  const stage = STAGES.find(s => s.id === stageId);
+  if (!stage) return res.status(404).json({ error: 'مرحله پیدا نشد' });
   try {
     const user = await users.findById(req.user.id);
     if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    if (user.banned) return res.status(403).json({ error: 'حساب شما مسدود شده است', banned: true });
+    if (stage.id !== user.unlockedStage) return res.status(400).json({ error: 'فقط مرحله‌ی فعلی رو می‌شه رد کرد' });
     if (user.coins < cost) return res.status(400).json({ error: 'سکه کافی نیست' });
+
+    const patch = { coins: user.coins - cost };
+    if (user.unlockedStage < STAGES.length) patch.unlockedStage = user.unlockedStage + 1;
+    const updated = await users.updateUser(user.id, patch);
+    res.json({ user: publicUser(updated), nextStageId: patch.unlockedStage || user.unlockedStage });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+app.post('/api/stage/:id/hint', authRequired, async (req, res) => {
+  const cost = 15;
+  const stage = STAGES.find(s => s.id === parseInt(req.params.id));
+  if (!stage) return res.status(404).json({ error: 'مرحله پیدا نشد' });
+  try {
+    const user = await users.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    if (user.banned) return res.status(403).json({ error: 'حساب شما مسدود شده است', banned: true });
+    if (user.coins < cost) return res.status(400).json({ error: 'سکه کافی نیست' });
+
+    const progress = new Set((user.stageProgress && user.stageProgress[stage.id]) || []);
+    const unsolved = stage.words.filter(w => !progress.has(w));
+    if (unsolved.length === 0) return res.status(400).json({ error: 'همه‌ی کلمات این مرحله پیدا شده‌اند' });
+
+    // Reveal one real letter from an unsolved word — costs coins, and only
+    // gives a small piece of the answer, never the whole word.
+    const target = unsolved[0];
+    const index = Math.floor(Math.random() * target.length);
+    const letter = target[index];
+
     const updated = await users.updateUser(user.id, { coins: user.coins - cost, hintsUsed: user.hintsUsed + 1 });
-    res.json({ user: publicUser(updated) });
+    res.json({ user: publicUser(updated), reveal: { wordLength: target.length, index, letter } });
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
@@ -172,21 +212,32 @@ app.get('/api/leaderboard', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
-app.post('/api/admin/login', (req, res) => {
-  const { username, password } = req.body || {};
-  if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
-    return res.status(401).json({ error: 'اطلاعات ادمین اشتباه است' });
-  }
-  const token = jwt.sign({ id: 0, username, role: 'admin' }, JWT_SECRET, { expiresIn: '12h' });
-  res.json({ token });
-});
+// Admin access is now a real role on a real account (owner / moderator),
+// checked server-side from the JWT — not a separate hardcoded password.
+// To make someone an owner, run this once in Supabase SQL Editor:
+//   update users set role = 'owner' where username = 'their_username';
+function ownerRequired(req, res, next) {
+  authRequired(req, res, () => {
+    if (req.user.role !== 'owner' && req.user.role !== 'creator') {
+      return res.status(403).json({ error: 'فقط سازنده/مدیر اصلی دسترسی دارد' });
+    }
+    next();
+  });
+}
+function testerRequired(req, res, next) {
+  authRequired(req, res, () => {
+    const ok = ['tester', 'owner', 'creator'].includes(req.user.role);
+    if (!ok) return res.status(403).json({ error: 'دسترسی پنل تستر لازم است' });
+    next();
+  });
+}
 
 app.get('/api/admin/players', adminRequired, async (req, res) => {
   try { res.json({ players: (await users.listAll()).map(publicUser) }); }
   catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
-app.post('/api/admin/players/:id/ban', adminRequired, async (req, res) => {
+app.post('/api/admin/players/:id/ban', ownerRequired, async (req, res) => {
   try {
     const target = await users.findById(parseInt(req.params.id));
     if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
@@ -196,7 +247,7 @@ app.post('/api/admin/players/:id/ban', adminRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
-app.post('/api/admin/players/:id/coins', adminRequired, async (req, res) => {
+app.post('/api/admin/players/:id/coins', ownerRequired, async (req, res) => {
   try {
     const target = await users.findById(parseInt(req.params.id));
     if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
@@ -303,6 +354,31 @@ function tryMatch() {
     io.to(room).emit('battle:start', { battleId, opponents: [{ id: a.data.user.id, username: a.data.user.username }, { id: b.data.user.id, username: b.data.user.username }] });
   }
 }
+
+// ================= TESTER TOOLS (real, tied to the account's own role) =================
+app.post('/api/tester/bugs', testerRequired, async (req, res) => {
+  const description = String((req.body && req.body.description) || '').slice(0, 1000).trim();
+  if (!description) return res.status(400).json({ error: 'توضیح باگ خالیه' });
+  const data = localDb.read();
+  const bug = {
+    id: localDb.nextId(data.reports), reporterId: req.user.id, reason: 'BUG: ' + description,
+    status: 'open', createdAt: new Date().toISOString(),
+  };
+  data.reports.push(bug);
+  localDb.write(data);
+  res.json({ ok: true, bug });
+});
+
+// Resets the CALLING tester's own account progress only — never another account.
+app.post('/api/tester/reset', testerRequired, async (req, res) => {
+  try {
+    const updated = await users.updateUser(req.user.id, {
+      coins: 40, xp: 0, level: 1, unlockedStage: 1, completedStages: [], stageProgress: {},
+      hintsUsed: 0, wordsFound: 0,
+    });
+    res.json({ user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
