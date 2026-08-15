@@ -258,6 +258,19 @@ app.post('/api/admin/players/:id/coins', ownerRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
+const VALID_ROLES = ['player', 'tester', 'moderator', 'owner', 'creator'];
+app.post('/api/admin/players/:id/role', ownerRequired, async (req, res) => {
+  try {
+    const target = await users.findById(parseInt(req.params.id));
+    if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    const role = String((req.body && req.body.role) || '').trim();
+    if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: 'نقش نامعتبر است' });
+    const updated = await users.updateUser(target.id, { role });
+    logAudit(req.user.username, 'ROLE_CHANGE', `player #${target.id} (${target.username}) -> ${role}`);
+    res.json({ user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
 app.get('/api/admin/reports', adminRequired, (req, res) => { res.json({ reports: localDb.read().reports }); });
 app.post('/api/admin/reports/:id/resolve', adminRequired, (req, res) => {
   const data = localDb.read();
