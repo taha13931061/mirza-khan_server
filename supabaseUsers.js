@@ -35,6 +35,8 @@ function fromRow(row) {
     stageProgress: row.stage_progress || {},
     hintsUsed: row.hints_used,
     wordsFound: row.words_found,
+    gems: row.gems || 0,
+    inventory: row.inventory || {},
     role: row.role,
     banned: row.banned,
     createdAt: row.created_at,
@@ -57,7 +59,7 @@ async function createUser({ username, passwordHash }) {
   const { data, error } = await getClient().from('users').insert({
     username, password_hash: passwordHash, coins: 40, xp: 0, level: 1,
     unlocked_stage: 1, completed_stages: [], stage_progress: {},
-    hints_used: 0, words_found: 0, role: 'player', banned: false,
+    hints_used: 0, words_found: 0, gems: 0, inventory: {}, role: 'player', banned: false,
   }).select().single();
   if (error) throw error;
   return fromRow(data);
@@ -74,6 +76,8 @@ async function updateUser(id, patch) {
   if ('stageProgress' in patch) row.stage_progress = patch.stageProgress;
   if ('hintsUsed' in patch) row.hints_used = patch.hintsUsed;
   if ('wordsFound' in patch) row.words_found = patch.wordsFound;
+  if ('gems' in patch) row.gems = patch.gems;
+  if ('inventory' in patch) row.inventory = patch.inventory;
   if ('banned' in patch) row.banned = patch.banned;
   if ('customId' in patch) row.custom_id = patch.customId;
   if ('role' in patch) row.role = patch.role;

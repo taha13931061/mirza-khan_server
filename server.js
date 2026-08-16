@@ -48,7 +48,8 @@ function publicUser(u) {
   return {
     id: u.id, customId: u.customId || null, username: u.username, coins: u.coins, xp: u.xp, level: u.level,
     unlockedStage: u.unlockedStage, completedStages: u.completedStages, stageProgress: u.stageProgress,
-    hintsUsed: u.hintsUsed, wordsFound: u.wordsFound, role: u.role, banned: u.banned
+    hintsUsed: u.hintsUsed, wordsFound: u.wordsFound, gems: u.gems || 0, inventory: u.inventory || {},
+    role: u.role, banned: u.banned
   };
 }
 function xpNeededFor(level) { return level * 100; }
@@ -258,6 +259,17 @@ app.post('/api/admin/players/:id/coins', ownerRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
+app.post('/api/admin/players/:id/gems', ownerRequired, async (req, res) => {
+  try {
+    const target = await users.findById(parseInt(req.params.id));
+    if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    const delta = parseInt(req.body.delta) || 0;
+    const updated = await users.updateUser(target.id, { gems: Math.max(0, (target.gems || 0) + delta) });
+    logAudit(req.user.username, 'GEM_ADJUST', `player #${target.id} delta=${delta}`);
+    res.json({ user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
 const VALID_ROLES = ['player', 'tester', 'moderator', 'owner', 'creator'];
 app.post('/api/admin/players/:id/role', ownerRequired, async (req, res) => {
   try {
@@ -394,6 +406,35 @@ app.post('/api/tester/reset', testerRequired, async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// ================= SHOP (server-validated — client can never grant itself items) =================
+const SHOP_ITEMS = {
+  hint3:      { price: 30, cur: 'coins', key: 'extraHints',  amount: 3 },
+  hint10:     { price: 8,  cur: 'gems',  key: 'extraHints',  amount: 10 },
+  heart1:     { price: 20, cur: 'coins', key: 'extraHearts', amount: 1 },
+  heart5:     { price: 6,  cur: 'gems',  key: 'extraHearts', amount: 5 },
+  frame_gold: { price: 15, cur: 'gems',  key: 'frame_gold',  amount: 1, once: true },
+  skip1:      { price: 25, cur: 'gems',  key: 'stageSkips',  amount: 1 },
+};
+app.post('/api/shop/buy', authRequired, async (req, res) => {
+  try {
+    const itemId = String((req.body && req.body.itemId) || '');
+    const item = SHOP_ITEMS[itemId];
+    if (!item) return res.status(400).json({ error: 'آیتم نامعتبر است' });
+    const user = await users.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    if (user.banned) return res.status(403).json({ error: 'حساب شما مسدود شده است', banned: true });
+    const inventory = Object.assign({}, user.inventory);
+    if (item.once && inventory[item.key]) return res.status(400).json({ error: 'قبلاً این آیتم رو داری' });
+    const balance = item.cur === 'coins' ? user.coins : (user.gems || 0);
+    if (balance < item.price) return res.status(400).json({ error: 'موجودی کافی نیست' });
+    const patch = { inventory: Object.assign({}, inventory, { [item.key]: (inventory[item.key] || 0) + item.amount }) };
+    if (item.cur === 'coins') patch.coins = user.coins - item.price;
+    else patch.gems = (user.gems || 0) - item.price;
+    const updated = await users.updateUser(user.id, patch);
+    res.json({ user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('Mirza Khan server running on port ' + PORT));

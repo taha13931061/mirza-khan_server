@@ -10,6 +10,23 @@
 - `public/admin/index.html` — پنل مدیریت وب (با ورود جدا از بازیکن‌ها)
 - `.env.example` — نمونه‌ی تنظیمات امن (رمزها را اینجا ننویس، در `.env` واقعی بنویس)
 
+## ⚠️ یه کار دستی لازم (فقط یک بار) — اضافه کردن ستون جم
+این نسخه واحد پول «جم» و «کوله‌پشتی آیتم‌ها» رو اضافه کرده. چون حساب‌ها روی Supabase
+ذخیره می‌شن، باید یه بار این دستور رو تو **Supabase → SQL Editor** اجرا کنی:
+
+```sql
+alter table users add column if not exists gems integer default 0;
+alter table users add column if not exists inventory jsonb default '{}'::jsonb;
+```
+
+بدون این کار، سرور موقع ذخیره‌ی جم یا آیتم‌های خریداری‌شده خطا می‌ده.
+
+## برای این‌که یه حساب، مدیر اصلی (owner) بشه — یه بار دستی
+```sql
+update users set role = 'owner' where username = 'یوزرنیم_خودت';
+```
+این کار رو هم تو همون SQL Editor بزن. بعدش با همون حساب وارد بازی شو تا پنل مدیریت واقعاً کار کنه.
+
 ## قدم‌به‌قدم گذاشتنش روی اینترنت (Render.com — رایگان)
 
 ۱. برو به **github.com** و یه Repository جدید بساز (خالی)
