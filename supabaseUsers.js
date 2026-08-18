@@ -39,6 +39,7 @@ function fromRow(row) {
     inventory: row.inventory || {},
     role: row.role,
     banned: row.banned,
+    banUntil: row.ban_until || null,
     createdAt: row.created_at,
   };
 }
@@ -46,20 +47,41 @@ function fromRow(row) {
 async function findByUsername(username) {
   const { data, error } = await getClient().from('users').select('*').eq('username', username).maybeSingle();
   if (error) throw error;
-  return fromRow(data);
+  return await autoExpireBan(fromRow(data));
 }
 
 async function findById(id) {
   const { data, error } = await getClient().from('users').select('*').eq('id', id).maybeSingle();
   if (error) throw error;
-  return fromRow(data);
+  const user = fromRow(data);
+  return await autoExpireBan(user);
+}
+
+// A temporary ban whose time has passed lifts itself automatically — no admin action needed.
+async function autoExpireBan(user) {
+  if (user && user.banned && user.banUntil && new Date(user.banUntil).getTime() <= Date.now()) {
+    return await updateUser(user.id, { banned: false, banUntil: null });
+  }
+  return user;
+}
+
+async function generateUniqueCustomId() {
+  // 7-digit friendly ID like a Telegram/Discord numeric ID — not the small sequential DB id.
+  for (let i = 0; i < 10; i++) {
+    const candidate = String(Math.floor(1000000 + Math.random() * 9000000));
+    const { data } = await getClient().from('users').select('id').eq('custom_id', candidate).maybeSingle();
+    if (!data) return candidate;
+  }
+  return String(Date.now()).slice(-7); // extremely unlikely fallback
 }
 
 async function createUser({ username, passwordHash }) {
+  const customId = await generateUniqueCustomId();
   const { data, error } = await getClient().from('users').insert({
     username, password_hash: passwordHash, coins: 40, xp: 0, level: 1,
     unlocked_stage: 1, completed_stages: [], stage_progress: {},
     hints_used: 0, words_found: 0, gems: 0, inventory: {}, role: 'player', banned: false,
+    custom_id: customId,
   }).select().single();
   if (error) throw error;
   return fromRow(data);
@@ -79,6 +101,7 @@ async function updateUser(id, patch) {
   if ('gems' in patch) row.gems = patch.gems;
   if ('inventory' in patch) row.inventory = patch.inventory;
   if ('banned' in patch) row.banned = patch.banned;
+  if ('banUntil' in patch) row.ban_until = patch.banUntil;
   if ('customId' in patch) row.custom_id = patch.customId;
   if ('role' in patch) row.role = patch.role;
   const { data, error } = await getClient().from('users').update(row).eq('id', id).select().single();
@@ -92,4 +115,19 @@ async function listAll() {
   return (data || []).map(fromRow);
 }
 
-module.exports = { findByUsername, findById, createUser, updateUser, listAll };
+// ===== App-wide settings (maintenance mode) — one row in a tiny table =====
+async function getMaintenance() {
+  const { data, error } = await getClient().from('app_settings').select('*').eq('id', 1).maybeSingle();
+  if (error) throw error;
+  if (!data) return { enabled: false, reason: '', endsAt: null };
+  return { enabled: !!data.maintenance_enabled, reason: data.maintenance_reason || '', endsAt: data.maintenance_ends_at || null };
+}
+async function setMaintenance({ enabled, reason, endsAt }) {
+  const { error } = await getClient().from('app_settings').upsert({
+    id: 1, maintenance_enabled: !!enabled, maintenance_reason: reason || '', maintenance_ends_at: endsAt || null
+  });
+  if (error) throw error;
+  return { enabled: !!enabled, reason: reason || '', endsAt: endsAt || null };
+}
+
+module.exports = { findByUsername, findById, createUser, updateUser, listAll, getMaintenance, setMaintenance };

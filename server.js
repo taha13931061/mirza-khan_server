@@ -6,7 +6,8 @@ const jwt = require('jsonwebtoken');
 const http = require('http');
 const { Server } = require('socket.io');
 
-const localDb = require('./db');           // still used for chat / reports / audit / battles (fine to lose on restart)
+const localDb = require('./db');           // still used for audit log / battle matchmaking state (fine to lose on restart)
+const chat = require('./chat');            // real persistent chat/groups/reports (Supabase — survives restarts)
 const users = require('./supabaseUsers');  // accounts — persistent, survives restarts
 const { STAGES, rewardFor } = require('./stages');
 
@@ -49,7 +50,7 @@ function publicUser(u) {
     id: u.id, customId: u.customId || null, username: u.username, coins: u.coins, xp: u.xp, level: u.level,
     unlockedStage: u.unlockedStage, completedStages: u.completedStages, stageProgress: u.stageProgress,
     hintsUsed: u.hintsUsed, wordsFound: u.wordsFound, gems: u.gems || 0, inventory: u.inventory || {},
-    role: u.role, banned: u.banned
+    role: u.role, banned: u.banned, banUntil: u.banUntil || null
   };
 }
 function xpNeededFor(level) { return level * 100; }
@@ -88,8 +89,22 @@ app.get('/api/me', authRequired, async (req, res) => {
   try {
     const user = await users.findById(req.user.id);
     if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    let maintenance = { enabled: false };
+    try { maintenance = await users.getMaintenance(); } catch (e) {}
+    // owner/creator/tester can keep playing during maintenance to actually test it
+    const bypass = ['owner', 'creator', 'tester'].includes(user.role);
     if (user.banned) return res.status(403).json({ error: 'حساب شما مسدود شده است', banned: true });
-    res.json({ user: publicUser(user) });
+    res.json({ user: publicUser(user), maintenance: (maintenance.enabled && !bypass) ? maintenance : null });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+app.get('/api/users/lookup', authRequired, async (req, res) => {
+  try {
+    const username = String(req.query.username || '').trim();
+    if (!username) return res.status(400).json({ error: 'یوزرنیم رو بفرست' });
+    const target = await users.findByUsername(username);
+    if (!target) return res.status(404).json({ error: 'کاربری با این یوزرنیم پیدا نشد' });
+    res.json({ user: { id: target.id, username: target.username } }); // only non-sensitive fields
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
@@ -234,7 +249,14 @@ function testerRequired(req, res, next) {
 }
 
 app.get('/api/admin/players', adminRequired, async (req, res) => {
-  try { res.json({ players: (await users.listAll()).map(publicUser) }); }
+  try {
+    const list = (await users.listAll()).map(u => {
+      const pub = publicUser(u);
+      pub.presence = pub.banned ? (pub.banUntil ? 'tempban' : 'ban') : (presence.get(u.id)?.status || 'offline');
+      return pub;
+    });
+    res.json({ players: list });
+  }
   catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
@@ -242,8 +264,12 @@ app.post('/api/admin/players/:id/ban', ownerRequired, async (req, res) => {
   try {
     const target = await users.findById(parseInt(req.params.id));
     if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
-    const updated = await users.updateUser(target.id, { banned: !!req.body.banned });
-    logAudit(req.user.username, updated.banned ? 'BAN' : 'UNBAN', `player #${target.id} (${target.username})`);
+    const banned = !!req.body.banned;
+    // durationMinutes present => temporary ban; absent/0 with banned=true => permanent ban
+    const durationMinutes = parseInt(req.body.durationMinutes) || 0;
+    const banUntil = banned && durationMinutes > 0 ? new Date(Date.now() + durationMinutes * 60000).toISOString() : null;
+    const updated = await users.updateUser(target.id, { banned, banUntil });
+    logAudit(req.user.username, banned ? (banUntil ? 'TEMP_BAN' : 'BAN') : 'UNBAN', `player #${target.id} (${target.username})${banUntil ? ' until ' + banUntil : ''}`);
     res.json({ user: publicUser(updated) });
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
@@ -270,7 +296,7 @@ app.post('/api/admin/players/:id/gems', ownerRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
-const VALID_ROLES = ['player', 'tester', 'moderator', 'owner', 'creator'];
+const VALID_ROLES = ['player', 'tester', 'inspector', 'moderator', 'owner', 'creator'];
 app.post('/api/admin/players/:id/role', ownerRequired, async (req, res) => {
   try {
     const target = await users.findById(parseInt(req.params.id));
@@ -283,39 +309,52 @@ app.post('/api/admin/players/:id/role', ownerRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
-app.get('/api/admin/reports', adminRequired, (req, res) => { res.json({ reports: localDb.read().reports }); });
-app.post('/api/admin/reports/:id/resolve', adminRequired, (req, res) => {
-  const data = localDb.read();
-  const report = data.reports.find(r => r.id === parseInt(req.params.id));
-  if (!report) return res.status(404).json({ error: 'گزارش پیدا نشد' });
-  report.status = 'resolved'; localDb.write(data);
-  logAudit(req.user.username, 'REPORT_RESOLVE', `report #${report.id}`);
-  res.json({ report });
+app.get('/api/admin/reports', adminRequired, async (req, res) => {
+  try { res.json({ reports: await chat.listReports() }); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.post('/api/admin/reports/:id/resolve', adminRequired, async (req, res) => {
+  try {
+    const report = await chat.resolveReport(parseInt(req.params.id));
+    logAudit(req.user.username, 'REPORT_RESOLVE', `report #${report.id}`);
+    res.json({ report });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'گزارش پیدا نشد' }); }
 });
 app.get('/api/admin/audit-log', adminRequired, (req, res) => { res.json({ log: localDb.read().auditLog.slice(-200).reverse() }); });
 
 app.get('/api/admin/stats', adminRequired, async (req, res) => {
   try {
     const all = await users.listAll();
-    const data = localDb.read();
+    const [chatMessages, openReports] = await Promise.all([chat.countMessages(), chat.countOpenReports()]);
     res.json({
       totalPlayers: all.length,
       bannedPlayers: all.filter(u => u.banned).length,
       totalStagesCompleted: all.reduce((sum, u) => sum + u.completedStages.length, 0),
       totalCoinsInEconomy: all.reduce((sum, u) => sum + u.coins, 0),
-      chatMessages: data.chat.length,
-      openReports: data.reports.filter(r => r.status !== 'resolved').length,
+      chatMessages,
+      openReports,
     });
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
 const lastMessageAt = new Map();
+const presence = new Map(); // userId -> { status: 'online'|'playing', socketId }
+const userSockets = new Map(); // userId -> Set<socket> — for direct group/DM delivery
+function setPresence(userId, status) { presence.set(userId, { status, at: Date.now() }); }
 io.on('connection', (socket) => {
   socket.on('chat:auth', (token) => {
-    try { socket.data.user = jwt.verify(token, JWT_SECRET); socket.emit('chat:authed', { username: socket.data.user.username }); }
+    try {
+      socket.data.user = jwt.verify(token, JWT_SECRET);
+      socket.emit('chat:authed', { username: socket.data.user.username });
+      setPresence(socket.data.user.id, 'online');
+      if (!userSockets.has(socket.data.user.id)) userSockets.set(socket.data.user.id, new Set());
+      userSockets.get(socket.data.user.id).add(socket);
+    }
     catch { socket.emit('chat:error', 'توکن نامعتبر است'); }
   });
-  socket.on('chat:send', (text) => {
+  socket.on('presence:playing', () => { if (socket.data.user) setPresence(socket.data.user.id, 'playing'); });
+  socket.on('presence:idle', () => { if (socket.data.user) setPresence(socket.data.user.id, 'online'); });
+  socket.on('chat:send', async ({ room, text } = {}) => {
     const user = socket.data.user;
     if (!user) return socket.emit('chat:error', 'ابتدا وارد شوید');
     const now = Date.now();
@@ -323,19 +362,77 @@ io.on('connection', (socket) => {
     lastMessageAt.set(socket.id, now);
     const clean = String(text || '').slice(0, 300).trim();
     if (!clean) return;
-    const data = localDb.read();
-    const msg = { id: localDb.nextId(data.chat), userId: user.id, username: user.username, text: clean, createdAt: new Date().toISOString() };
-    data.chat.push(msg);
-    if (data.chat.length > 500) data.chat = data.chat.slice(-500);
-    localDb.write(data);
-    io.emit('chat:message', msg);
+    room = String(room || 'public');
+    try {
+      let targetRoom = room;
+      let recipients = null; // null = broadcast to everyone (public room)
+      if (room === 'public') {
+        recipients = null;
+      } else if (room.startsWith('group:')) {
+        const groupId = parseInt(room.slice(6));
+        if (!(await chat.isGroupMember(groupId, user.id))) return socket.emit('chat:error', 'عضو این گروه نیستی');
+        recipients = await chat.getGroupMembers(groupId);
+      } else if (room.startsWith('dm:')) {
+        // client sends dm:<otherUserId> as a request — resolve to the canonical room key
+        const otherId = parseInt(room.slice(3));
+        targetRoom = chat.dmRoom(user.id, otherId);
+        recipients = [user.id, otherId];
+      } else {
+        return socket.emit('chat:error', 'اتاق نامعتبر است');
+      }
+      const msg = await chat.saveMessage({ room: targetRoom, senderId: user.id, senderUsername: user.username, text: clean });
+      if (recipients === null) {
+        io.emit('chat:message', msg);
+      } else {
+        for (const uid of recipients) {
+          const sockets = userSockets.get(uid);
+          if (sockets) for (const s of sockets) s.emit('chat:message', msg);
+        }
+      }
+    } catch (e) { console.error(e); socket.emit('chat:error', 'ارسال پیام انجام نشد'); }
   });
-  socket.on('chat:report', ({ messageId, reason }) => {
+  socket.on('chat:history', async ({ room } = {}, cb) => {
+    const user = socket.data.user;
+    if (!user) return cb && cb({ error: 'ابتدا وارد شوید' });
+    room = String(room || 'public');
+    try {
+      let targetRoom = room;
+      if (room.startsWith('group:')) {
+        const groupId = parseInt(room.slice(6));
+        if (!(await chat.isGroupMember(groupId, user.id))) return cb && cb({ error: 'عضو این گروه نیستی' });
+      } else if (room.startsWith('dm:')) {
+        const otherId = parseInt(room.slice(3));
+        targetRoom = chat.dmRoom(user.id, otherId);
+      }
+      const messages = await chat.getHistory(targetRoom);
+      cb && cb({ messages });
+    } catch (e) { console.error(e); cb && cb({ error: 'خطای سرور' }); }
+  });
+  socket.on('group:create', async ({ name } = {}, cb) => {
+    const user = socket.data.user; if (!user) return cb && cb({ error: 'ابتدا وارد شوید' });
+    if (!name || !name.trim()) return cb && cb({ error: 'اسم گروه رو بنویس' });
+    try { const group = await chat.createGroup(name.trim(), user.id); cb && cb({ group }); }
+    catch (e) { console.error(e); cb && cb({ error: 'ساخت گروه انجام نشد' }); }
+  });
+  socket.on('group:join', async ({ groupId } = {}, cb) => {
+    const user = socket.data.user; if (!user) return cb && cb({ error: 'ابتدا وارد شوید' });
+    try { await chat.joinGroup(parseInt(groupId), user.id); cb && cb({ ok: true }); }
+    catch (e) { console.error(e); cb && cb({ error: 'عضویت انجام نشد' }); }
+  });
+  socket.on('group:mine', async (_payload, cb) => {
+    const user = socket.data.user; if (!user) return cb && cb({ error: 'ابتدا وارد شوید' });
+    try { const groups = await chat.listUserGroups(user.id); cb && cb({ groups }); }
+    catch (e) { console.error(e); cb && cb({ error: 'خطای سرور' }); }
+  });
+  socket.on('group:all', async (_payload, cb) => {
+    const user = socket.data.user; if (!user) return cb && cb({ error: 'ابتدا وارد شوید' });
+    try { const groups = await chat.listAllGroups(); cb && cb({ groups }); }
+    catch (e) { console.error(e); cb && cb({ error: 'خطای سرور' }); }
+  });
+  socket.on('chat:report', async ({ messageId, reason } = {}) => {
     const user = socket.data.user; if (!user) return;
-    const data = localDb.read();
-    const msg = data.chat.find(m => m.id === messageId);
-    data.reports.push({ id: localDb.nextId(data.reports), reporterId: user.id, targetId: msg ? msg.userId : null, reason: String(reason || '').slice(0, 200), status: 'open', createdAt: new Date().toISOString() });
-    localDb.write(data);
+    try { await chat.saveReport({ reporterId: user.id, messageId, reason }); }
+    catch (e) { console.error(e); }
   });
   socket.on('battle:join', () => {
     const user = socket.data.user; if (!user) return socket.emit('chat:error', 'ابتدا وارد شوید');
@@ -366,7 +463,14 @@ io.on('connection', (socket) => {
     io.to(battle.room).emit('battle:result', { winnerId, scores: battle.scores });
     delete activeBattles[battleId];
   });
-  socket.on('disconnect', () => { const idx = waitingQueue.indexOf(socket); if (idx !== -1) waitingQueue.splice(idx, 1); });
+  socket.on('disconnect', () => {
+    const idx = waitingQueue.indexOf(socket); if (idx !== -1) waitingQueue.splice(idx, 1);
+    if (socket.data.user) {
+      presence.delete(socket.data.user.id);
+      const set = userSockets.get(socket.data.user.id);
+      if (set) { set.delete(socket); if (set.size === 0) userSockets.delete(socket.data.user.id); }
+    }
+  });
 });
 let waitingQueue = [], activeBattles = {}, battleCounter = 1;
 function tryMatch() {
@@ -376,6 +480,7 @@ function tryMatch() {
     const battleId = 'b' + (battleCounter++), room = 'battle:' + battleId;
     a.join(room); b.join(room);
     activeBattles[battleId] = { room, players: [a.data.user.id, b.data.user.id], scores: {}, finished: false };
+    setPresence(a.data.user.id, 'playing'); setPresence(b.data.user.id, 'playing');
     io.to(room).emit('battle:start', { battleId, opponents: [{ id: a.data.user.id, username: a.data.user.username }, { id: b.data.user.id, username: b.data.user.username }] });
   }
 }
@@ -384,14 +489,10 @@ function tryMatch() {
 app.post('/api/tester/bugs', testerRequired, async (req, res) => {
   const description = String((req.body && req.body.description) || '').slice(0, 1000).trim();
   if (!description) return res.status(400).json({ error: 'توضیح باگ خالیه' });
-  const data = localDb.read();
-  const bug = {
-    id: localDb.nextId(data.reports), reporterId: req.user.id, reason: 'BUG: ' + description,
-    status: 'open', createdAt: new Date().toISOString(),
-  };
-  data.reports.push(bug);
-  localDb.write(data);
-  res.json({ ok: true, bug });
+  try {
+    await chat.saveReport({ reporterId: req.user.id, messageId: null, reason: 'BUG: ' + description });
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
 // Resets the CALLING tester's own account progress only — never another account.
@@ -406,6 +507,44 @@ app.post('/api/tester/reset', testerRequired, async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// ================= MAINTENANCE MODE (real — replaces the old fake test-mode button) =================
+app.get('/api/maintenance/status', async (req, res) => {
+  try { res.json(await users.getMaintenance()); }
+  catch (e) { res.json({ enabled: false, reason: '', endsAt: null }); } // fail open so a missing table never locks the whole game out
+});
+app.post('/api/admin/maintenance', ownerRequired, async (req, res) => {
+  try {
+    const { enabled, reason, endsAt } = req.body || {};
+    const result = await users.setMaintenance({ enabled, reason, endsAt });
+    logAudit(req.user.username, enabled ? 'MAINTENANCE_ON' : 'MAINTENANCE_OFF', reason || '');
+    res.json(result);
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول app_settings رو تو Supabase ساختی؟' }); }
+});
+
+// ================= OWNER: create dedicated tester/inspector panel accounts =================
+app.post('/api/admin/create-panel-account', ownerRequired, async (req, res) => {
+  try {
+    const { username, password, role } = req.body || {};
+    if (!username || !password || password.length < 6) return res.status(400).json({ error: 'یوزرنیم و رمز (حداقل ۶ کاراکتر) لازم است' });
+    if (!['tester', 'inspector'].includes(role)) return res.status(400).json({ error: 'نقش باید tester یا inspector باشد' });
+    const existing = await users.findByUsername(username);
+    if (existing) return res.status(400).json({ error: 'این یوزرنیم قبلاً گرفته شده' });
+    const passwordHash = await bcrypt.hash(password, 10);
+    const created = await users.createUser({ username, passwordHash });
+    const updated = await users.updateUser(created.id, { role });
+    logAudit(req.user.username, 'CREATE_PANEL_ACCOUNT', `${role} account #${updated.id} (${username})`);
+    res.json({ user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.get('/api/admin/panel-accounts', adminRequired, async (req, res) => {
+  try {
+    const all = await users.listAll();
+    const panelUsers = all.filter(u => ['tester', 'inspector'].includes(u.role)).map(publicUser);
+    res.json({ users: panelUsers });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
 
 // ================= SHOP (server-validated — client can never grant itself items) =================
 const SHOP_ITEMS = {

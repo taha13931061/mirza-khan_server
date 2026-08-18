@@ -17,7 +17,46 @@
 ```sql
 alter table users add column if not exists gems integer default 0;
 alter table users add column if not exists inventory jsonb default '{}'::jsonb;
+alter table users add column if not exists ban_until timestamptz;
+alter table users add column if not exists custom_id text unique;
+create table if not exists app_settings (
+  id integer primary key,
+  maintenance_enabled boolean default false,
+  maintenance_reason text default '',
+  maintenance_ends_at timestamptz
+);
+create table if not exists chat_messages (
+  id bigserial primary key,
+  room text not null,
+  sender_id integer not null,
+  sender_username text not null,
+  text text not null,
+  created_at timestamptz default now()
+);
+create index if not exists chat_messages_room_idx on chat_messages(room, created_at);
+create table if not exists chat_groups (
+  id bigserial primary key,
+  name text not null,
+  creator_id integer not null,
+  created_at timestamptz default now()
+);
+create table if not exists chat_group_members (
+  group_id bigint references chat_groups(id) on delete cascade,
+  user_id integer not null,
+  primary key (group_id, user_id)
+);
+create table if not exists chat_reports (
+  id bigserial primary key,
+  reporter_id integer not null,
+  message_id bigint,
+  reason text,
+  status text default 'open',
+  created_at timestamptz default now()
+);
 ```
+
+این جدول‌های جدید باعث می‌شن چت (همگانی، گروهی، خصوصی) و گزارش‌ها واقعاً رو سرور ذخیره بشن —
+قبلاً رو یه فایل محلی بودن که هر بار سرور ری‌استارت/آپدیت می‌شد، پاک می‌شدن.
 
 بدون این کار، سرور موقع ذخیره‌ی جم یا آیتم‌های خریداری‌شده خطا می‌ده.
 
