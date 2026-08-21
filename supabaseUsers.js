@@ -130,4 +130,9 @@ async function setMaintenance({ enabled, reason, endsAt }) {
   return { enabled: !!enabled, reason: reason || '', endsAt: endsAt || null };
 }
 
-module.exports = { findByUsername, findById, createUser, updateUser, listAll, getMaintenance, setMaintenance };
+async function deleteUser(id) {
+  const { error } = await getClient().from('users').delete().eq('id', id);
+  if (error) throw error;
+}
+
+module.exports = { findByUsername, findById, createUser, updateUser, deleteUser, listAll, getMaintenance, setMaintenance };

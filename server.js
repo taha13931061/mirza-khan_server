@@ -10,6 +10,11 @@ const localDb = require('./db');           // still used for audit log / battle 
 const chat = require('./chat');            // real persistent chat/groups/reports (Supabase — survives restarts)
 const users = require('./supabaseUsers');  // accounts — persistent, survives restarts
 const { STAGES, rewardFor } = require('./stages');
+const riddles = require('./riddles');
+let customStages = []; // loaded from Supabase at boot — lets the owner add stages without a redeploy
+async function reloadCustomStages() { try { customStages = await chat.listCustomStages(); } catch (e) { console.error('custom stages load failed', e.message); } }
+function findStage(id) { return STAGES.find(s => s.id === id) || customStages.find(s => s.id === id); }
+function allStages() { return [...STAGES, ...customStages]; }
 
 const app = express();
 const server = http.createServer(app);
@@ -109,11 +114,11 @@ app.get('/api/users/lookup', authRequired, async (req, res) => {
 });
 
 app.get('/api/stages', (req, res) => {
-  res.json({ stages: STAGES.map(s => ({ id: s.id, name: s.name, wordCount: s.words.length })) });
+  res.json({ stages: allStages().map(s => ({ id: s.id, name: s.name, wordCount: s.words.length })) });
 });
 
 app.get('/api/stage/:id/play', authRequired, async (req, res) => {
-  const stage = STAGES.find(s => s.id === parseInt(req.params.id));
+  const stage = findStage(parseInt(req.params.id));
   if (!stage) return res.status(404).json({ error: 'مرحله پیدا نشد' });
   try {
     const user = await users.findById(req.user.id);
@@ -131,7 +136,7 @@ app.get('/api/stage/:id/play', authRequired, async (req, res) => {
 });
 
 app.post('/api/stage/:id/check', authRequired, async (req, res) => {
-  const stage = STAGES.find(s => s.id === parseInt(req.params.id));
+  const stage = findStage(parseInt(req.params.id));
   if (!stage) return res.status(404).json({ error: 'مرحله پیدا نشد' });
   const word = String((req.body && req.body.word) || '').trim();
   try {
@@ -176,7 +181,7 @@ app.post('/api/stage/:id/check', authRequired, async (req, res) => {
 app.post('/api/stage/skip', authRequired, async (req, res) => {
   const cost = 30;
   const stageId = parseInt((req.body && req.body.stageId) || 0);
-  const stage = STAGES.find(s => s.id === stageId);
+  const stage = findStage(stageId);
   if (!stage) return res.status(404).json({ error: 'مرحله پیدا نشد' });
   try {
     const user = await users.findById(req.user.id);
@@ -194,7 +199,7 @@ app.post('/api/stage/skip', authRequired, async (req, res) => {
 
 app.post('/api/stage/:id/hint', authRequired, async (req, res) => {
   const cost = 15;
-  const stage = STAGES.find(s => s.id === parseInt(req.params.id));
+  const stage = findStage(parseInt(req.params.id));
   if (!stage) return res.status(404).json({ error: 'مرحله پیدا نشد' });
   try {
     const user = await users.findById(req.user.id);
@@ -247,6 +252,51 @@ function testerRequired(req, res, next) {
     next();
   });
 }
+function inspectorRequired(req, res, next) {
+  authRequired(req, res, () => {
+    const ok = ['inspector', 'owner', 'creator'].includes(req.user.role);
+    if (!ok) return res.status(403).json({ error: 'دسترسی پنل بازرسی لازم است' });
+    next();
+  });
+}
+
+app.get('/api/inspector/suspicious-users', inspectorRequired, async (req, res) => {
+  try {
+    const all = await users.listAll();
+    // Simple, explainable heuristic: big coin balance with very little real progress,
+    // or a lot of hints used relative to words actually found — worth a human look, not proof of cheating.
+    const flagged = all.filter(u =>
+      (u.coins > 5000 && u.completedStages.length < 5) ||
+      (u.hintsUsed > 20 && u.wordsFound < 5)
+    ).map(u => ({
+      id: u.id, username: u.username, level: u.level, coins: u.coins, gems: u.gems,
+      reason: (u.coins > 5000 && u.completedStages.length < 5)
+        ? 'سکه‌ی زیاد با پیشرفت خیلی کم'
+        : 'استفاده‌ی زیاد از راهنما با کلمه‌ی خیلی کم'
+    }));
+    res.json({ users: flagged });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+app.get('/api/inspector/user-logs', inspectorRequired, async (req, res) => {
+  try {
+    const q = String(req.query.username || req.query.userId || '').trim();
+    if (!q) return res.status(400).json({ error: 'یوزرنیم یا User ID رو بفرست' });
+    const log = localDb.read().auditLog.filter(l => l.detail && l.detail.includes(q));
+    res.json({ log: log.slice(-100).reverse() });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+app.get('/api/inspector/ban-reports', inspectorRequired, async (req, res) => {
+  try {
+    const all = await users.listAll();
+    const banned = all.filter(u => u.banned).map(u => ({
+      id: u.id, username: u.username, banUntil: u.banUntil,
+      type: u.banUntil ? 'موقت' : 'دائمی'
+    }));
+    res.json({ bans: banned });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
 
 app.get('/api/admin/players', adminRequired, async (req, res) => {
   try {
@@ -260,7 +310,43 @@ app.get('/api/admin/players', adminRequired, async (req, res) => {
   catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
-app.post('/api/admin/players/:id/ban', ownerRequired, async (req, res) => {
+// Owner-only, irreversible. The requesting owner can never delete their own account this way.
+app.delete('/api/admin/players/:id', ownerRequired, async (req, res) => {
+  try {
+    const targetId = parseInt(req.params.id);
+    if (targetId === req.user.id) return res.status(400).json({ error: 'نمی‌تونی حساب خودت رو حذف کنی' });
+    const target = await users.findById(targetId);
+    if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    await users.deleteUser(targetId);
+    logAudit(req.user.username, 'DELETE_ACCOUNT', `player #${targetId} (${target.username})`);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+app.post('/api/admin/stages', ownerRequired, async (req, res) => {
+  try {
+    const { letters, words, name, charEmoji, charName } = req.body || {};
+    if (!Array.isArray(letters) || !letters.length) return res.status(400).json({ error: 'حروف مرحله رو بفرست' });
+    if (!Array.isArray(words) || !words.length) return res.status(400).json({ error: 'کلمات مرحله رو بفرست' });
+    if (!name) return res.status(400).json({ error: 'اسم مرحله رو بفرست' });
+    const availableLetters = {};
+    for (const l of letters) availableLetters[l] = (availableLetters[l] || 0) + 1;
+    for (const w of words) {
+      const need = {};
+      for (const ch of w) need[ch] = (need[ch] || 0) + 1;
+      for (const ch in need) if ((availableLetters[ch] || 0) < need[ch]) {
+        return res.status(400).json({ error: `کلمه "${w}" با حروف داده‌شده ساخته نمی‌شه (حرف "${ch}" کمه)` });
+      }
+    }
+    const nextId = Math.max(0, ...allStages().map(s => s.id)) + 1;
+    const stage = { id: nextId, letters, words, name, char: { emoji: charEmoji || '🎮', name: charName || 'شخصیت مرحله' } };
+    await chat.addCustomStage(stage);
+    customStages.push(stage);
+    logAudit(req.user.username, 'ADD_STAGE', `stage #${nextId} (${name})`);
+    res.json({ stage });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.post('/api/admin/players/:id/ban', adminRequired, async (req, res) => {
   try {
     const target = await users.findById(parseInt(req.params.id));
     if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
@@ -274,7 +360,7 @@ app.post('/api/admin/players/:id/ban', ownerRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
-app.post('/api/admin/players/:id/coins', ownerRequired, async (req, res) => {
+app.post('/api/admin/players/:id/coins', adminRequired, async (req, res) => {
   try {
     const target = await users.findById(parseInt(req.params.id));
     if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
@@ -285,7 +371,7 @@ app.post('/api/admin/players/:id/coins', ownerRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
-app.post('/api/admin/players/:id/gems', ownerRequired, async (req, res) => {
+app.post('/api/admin/players/:id/gems', adminRequired, async (req, res) => {
   try {
     const target = await users.findById(parseInt(req.params.id));
     if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
@@ -434,37 +520,41 @@ io.on('connection', (socket) => {
     try { await chat.saveReport({ reporterId: user.id, messageId, reason }); }
     catch (e) { console.error(e); }
   });
-  socket.on('battle:join', () => {
+  socket.on('battle:join', ({ level } = {}) => {
     const user = socket.data.user; if (!user) return socket.emit('chat:error', 'ابتدا وارد شوید');
-    waitingQueue.push(socket); tryMatch();
+    level = ['green', 'yellow', 'red'].includes(level) ? level : 'green';
+    if (!battleQueues[level].includes(socket)) battleQueues[level].push(socket);
+    socket.data.battleLevel = level;
+    tryMatch(level);
   });
-  socket.on('battle:answer', ({ battleId, correct }) => {
-    const battle = activeBattles[battleId]; if (!battle) return;
-    const user = socket.data.user; if (!battle.players.includes(user.id)) return;
-    battle.scores[user.id] = (battle.scores[user.id] || 0) + (correct ? 1 : 0);
-    io.to(battle.room).emit('battle:score', battle.scores);
+  socket.on('battle:answer_riddle', ({ battleId, riddleId, answer } = {}, cb) => {
+    const battle = activeBattles[battleId]; if (!battle) return cb && cb({ error: 'مسابقه پیدا نشد' });
+    const user = socket.data.user; if (!battle.players.includes(user.id)) return cb && cb({ error: 'دسترسی نداری' });
+    if (battle.finished) return cb && cb({ error: 'مسابقه تموم شده' });
+    const riddle = battle.riddles.find(r => r.id === riddleId); if (!riddle) return cb && cb({ error: 'سوال پیدا نشد' });
+    if (!battle.solved[user.id]) battle.solved[user.id] = new Set();
+    const normalize = s => String(s || '').trim().replace(/[\u200c\s]+/g, '');
+    const correct = normalize(answer) === normalize(riddle.answer);
+    if (correct) battle.solved[user.id].add(riddleId);
+    const scores = {}; for (const pid of battle.players) scores[pid] = (battle.solved[pid] || new Set()).size;
+    io.to(battle.room).emit('battle:score', scores);
+    cb && cb({ correct });
+    if (correct && battle.solved[user.id].size >= battle.riddles.length) {
+      finishBattle(battleId, user.id);
+    }
   });
   socket.on('battle:finish', async ({ battleId }) => {
     const battle = activeBattles[battleId]; if (!battle || battle.finished) return;
-    battle.finished = true;
-    const [p1, p2] = battle.players;
-    const s1 = battle.scores[p1] || 0, s2 = battle.scores[p2] || 0;
-    const winnerId = s1 === s2 ? null : (s1 > s2 ? p1 : p2);
-    if (winnerId) {
-      try {
-        const winner = await users.findById(winnerId);
-        if (winner) {
-          const tempUser = { xp: winner.xp, level: winner.level };
-          applyXp(tempUser, 40);
-          await users.updateUser(winnerId, { coins: winner.coins + 30, xp: tempUser.xp, level: tempUser.level });
-        }
-      } catch (e) { console.error(e); }
+    battle.finishedPlayers.add(socket.data.user?.id);
+    if (battle.finishedPlayers.size >= battle.players.length) {
+      const scores = battle.players.map(pid => ({ pid, n: (battle.solved[pid] || new Set()).size }));
+      scores.sort((a, b) => b.n - a.n);
+      const winnerId = scores[0].n === scores[1]?.n ? null : scores[0].pid;
+      finishBattle(battleId, winnerId);
     }
-    io.to(battle.room).emit('battle:result', { winnerId, scores: battle.scores });
-    delete activeBattles[battleId];
   });
   socket.on('disconnect', () => {
-    const idx = waitingQueue.indexOf(socket); if (idx !== -1) waitingQueue.splice(idx, 1);
+    ['green', 'yellow', 'red'].forEach(l => { const idx = battleQueues[l].indexOf(socket); if (idx !== -1) battleQueues[l].splice(idx, 1); });
     if (socket.data.user) {
       presence.delete(socket.data.user.id);
       const set = userSockets.get(socket.data.user.id);
@@ -472,17 +562,44 @@ io.on('connection', (socket) => {
     }
   });
 });
-let waitingQueue = [], activeBattles = {}, battleCounter = 1;
-function tryMatch() {
-  while (waitingQueue.length >= 2) {
-    const a = waitingQueue.shift(), b = waitingQueue.shift();
+let battleQueues = { green: [], yellow: [], red: [] }, activeBattles = {}, battleCounter = 1;
+function tryMatch(level) {
+  const q = battleQueues[level];
+  while (q.length >= 2) {
+    const a = q.shift(), b = q.shift();
     if (!a.connected || !b.connected) continue;
     const battleId = 'b' + (battleCounter++), room = 'battle:' + battleId;
     a.join(room); b.join(room);
-    activeBattles[battleId] = { room, players: [a.data.user.id, b.data.user.id], scores: {}, finished: false };
+    const stageRiddles = riddles.pickFive(level);
+    activeBattles[battleId] = {
+      room, level, players: [a.data.user.id, b.data.user.id],
+      riddles: stageRiddles, solved: {}, finishedPlayers: new Set(), finished: false,
+    };
     setPresence(a.data.user.id, 'playing'); setPresence(b.data.user.id, 'playing');
-    io.to(room).emit('battle:start', { battleId, opponents: [{ id: a.data.user.id, username: a.data.user.username }, { id: b.data.user.id, username: b.data.user.username }] });
+    const publicRiddles = stageRiddles.map(r => ({ id: r.id, question: r.question }));
+    io.to(room).emit('battle:start', {
+      battleId, level, riddles: publicRiddles,
+      opponents: [{ id: a.data.user.id, username: a.data.user.username }, { id: b.data.user.id, username: b.data.user.username }]
+    });
   }
+}
+async function finishBattle(battleId, winnerId) {
+  const battle = activeBattles[battleId]; if (!battle || battle.finished) return;
+  battle.finished = true;
+  const scores = {}; for (const pid of battle.players) scores[pid] = (battle.solved[pid] || new Set()).size;
+  if (winnerId) {
+    try {
+      const reward = riddles.REWARDS[battle.level] || riddles.REWARDS.green;
+      const winner = await users.findById(winnerId);
+      if (winner) {
+        const tempUser = { xp: winner.xp, level: winner.level };
+        applyXp(tempUser, 40);
+        await users.updateUser(winnerId, { coins: winner.coins + reward.coins, gems: (winner.gems || 0) + reward.gems, xp: tempUser.xp, level: tempUser.level });
+      }
+    } catch (e) { console.error(e); }
+  }
+  io.to(battle.room).emit('battle:result', { winnerId, scores, level: battle.level });
+  delete activeBattles[battleId];
 }
 
 // ================= TESTER TOOLS (real, tied to the account's own role) =================
@@ -527,7 +644,7 @@ app.post('/api/admin/create-panel-account', ownerRequired, async (req, res) => {
   try {
     const { username, password, role } = req.body || {};
     if (!username || !password || password.length < 6) return res.status(400).json({ error: 'یوزرنیم و رمز (حداقل ۶ کاراکتر) لازم است' });
-    if (!['tester', 'inspector'].includes(role)) return res.status(400).json({ error: 'نقش باید tester یا inspector باشد' });
+    if (!['tester', 'inspector', 'moderator'].includes(role)) return res.status(400).json({ error: 'نقش باید tester، inspector یا moderator باشد' });
     const existing = await users.findByUsername(username);
     if (existing) return res.status(400).json({ error: 'این یوزرنیم قبلاً گرفته شده' });
     const passwordHash = await bcrypt.hash(password, 10);
@@ -540,7 +657,7 @@ app.post('/api/admin/create-panel-account', ownerRequired, async (req, res) => {
 app.get('/api/admin/panel-accounts', adminRequired, async (req, res) => {
   try {
     const all = await users.listAll();
-    const panelUsers = all.filter(u => ['tester', 'inspector'].includes(u.role)).map(publicUser);
+    const panelUsers = all.filter(u => ['tester', 'inspector', 'moderator'].includes(u.role)).map(publicUser);
     res.json({ users: panelUsers });
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
@@ -577,3 +694,4 @@ app.post('/api/shop/buy', authRequired, async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('Mirza Khan server running on port ' + PORT));
+reloadCustomStages();

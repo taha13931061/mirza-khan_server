@@ -53,6 +53,14 @@ create table if not exists chat_reports (
   status text default 'open',
   created_at timestamptz default now()
 );
+
+create table if not exists custom_stages (
+  id integer primary key,
+  letters jsonb not null,
+  words jsonb not null,
+  name text not null,
+  char jsonb not null
+);
 ```
 
 این جدول‌های جدید باعث می‌شن چت (همگانی، گروهی، خصوصی) و گزارش‌ها واقعاً رو سرور ذخیره بشن —

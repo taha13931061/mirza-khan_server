@@ -120,7 +120,21 @@ async function listAllGroups(limit = 100) {
   return (data || []).map(g => ({ id: g.id, name: g.name, creatorId: g.creator_id }));
 }
 
+async function listCustomStages() {
+  const { data, error } = await getClient().from('custom_stages').select('*').order('id', { ascending: true });
+  if (error) throw error;
+  return (data || []).map(row => ({
+    id: row.id, letters: row.letters, words: row.words, name: row.name, char: row.char
+  }));
+}
+
+async function addCustomStage({ id, letters, words, name, char }) {
+  const { error } = await getClient().from('custom_stages').insert({ id, letters, words, name, char });
+  if (error) throw error;
+}
+
 module.exports = {
   dmRoom, saveMessage, getHistory, saveReport, listReports, resolveReport, countOpenReports, countMessages,
-  createGroup, joinGroup, isGroupMember, getGroupMembers, listUserGroups, listAllGroups
+  createGroup, joinGroup, isGroupMember, getGroupMembers, listUserGroups, listAllGroups,
+  listCustomStages, addCustomStage
 };
