@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -11,6 +13,9 @@ const chat = require('./chat');            // real persistent chat/groups/report
 const users = require('./supabaseUsers');  // accounts — persistent, survives restarts
 const { STAGES, rewardFor } = require('./stages');
 const riddles = require('./riddles');
+const progression = require('./progression');
+const profanity = require('./profanityFilter'); // filters cursing in chat text, group names, usernames
+const friends = require('./friends');           // real friends system (Supabase — replaces the old localStorage-only list)
 let customStages = []; // loaded from Supabase at boot — lets the owner add stages without a redeploy
 async function reloadCustomStages() { try { customStages = await chat.listCustomStages(); } catch (e) { console.error('custom stages load failed', e.message); } }
 function findStage(id) { return STAGES.find(s => s.id === id) || customStages.find(s => s.id === id); }
@@ -24,7 +29,26 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_THIS_SECRET_BEFORE_REAL_USE';
+// Stops brute-force password guessing — max 10 login/register attempts per IP every 15 minutes.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'تلاش‌های زیادی انجام شده — چند دقیقه صبر کن و دوباره امتحان کن.' },
+});
+// A gentler general limit for everything else, so one IP can't hammer the whole API.
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'درخواست‌های زیادی فرستادی — یه لحظه صبر کن.' },
+});
+app.use('/api/login', authLimiter);
+app.use('/api/register', authLimiter);
+app.use('/api/', generalLimiter);
+
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠️  JWT_SECRET env var is not set — using a random secret generated at startup.');
+  console.warn('⚠️  This is safe (no hardcoded/guessable secret), but every restart logs everyone out.');
+  console.warn('⚠️  Set a real JWT_SECRET in Render → Environment for sessions to survive restarts.');
+}
 // (Old hardcoded ADMIN_USERNAME/ADMIN_PASSWORD env vars are no longer used —
 // admin access is now a real 'owner'/'moderator' role on a real account.)
 
@@ -38,9 +62,22 @@ function authRequired(req, res, next) {
   try { req.user = jwt.verify(token, JWT_SECRET); next(); }
   catch { return res.status(401).json({ error: 'توکن نامعتبر است' }); }
 }
+// Re-fetches the user from the DB and trusts THAT role/ban status, never the JWT's
+// embedded copy. The JWT is valid for 30 days, so without this a role change or a ban
+// wouldn't take effect until the token expired — a demoted/banned admin could keep
+// using admin routes with their old token. Attach the fresh user onto req for reuse.
+async function requireFreshUser(req, res) {
+  const user = await users.findById(req.user.id);
+  if (!user) { res.status(401).json({ error: 'حساب پیدا نشد' }); return null; }
+  if (user.banned) { res.status(403).json({ error: 'حساب شما مسدود شده است', banned: true }); return null; }
+  req.user.role = user.role; // DB role always wins over the token's (possibly stale) role
+  req.freshUser = user;
+  return user;
+}
 function adminRequired(req, res, next) {
-  authRequired(req, res, () => {
-    const ok = ['owner', 'moderator', 'creator'].includes(req.user.role);
+  authRequired(req, res, async () => {
+    const user = await requireFreshUser(req, res); if (!user) return;
+    const ok = ['owner', 'moderator', 'creator'].includes(user.role);
     if (!ok) return res.status(403).json({ error: 'دسترسی پنل مدیریت لازم است' });
     next();
   });
@@ -67,8 +104,11 @@ function applyXp(user, amount) {
 app.post('/api/register', async (req, res) => {
   try {
     const { username, password } = req.body || {};
-    if (!username || !password || password.length < 4) {
-      return res.status(400).json({ error: 'نام کاربری و رمز عبور (حداقل ۴ کاراکتر) لازم است' });
+    if (!username || !password || password.length < 6) {
+      return res.status(400).json({ error: 'نام کاربری و رمز عبور (حداقل ۶ کاراکتر) لازم است' });
+    }
+    if (profanity.containsProfanity(username)) {
+      return res.status(400).json({ error: 'این نام کاربری مجاز نیست — لطفاً اسم دیگه‌ای انتخاب کن' });
     }
     const existing = await users.findByUsername(username);
     if (existing) return res.status(409).json({ error: 'این نام کاربری قبلاً گرفته شده' });
@@ -113,6 +153,55 @@ app.get('/api/users/lookup', authRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
+// ================= FRIENDS (real, server-verified — replaces the old localStorage-only list) =================
+async function friendUserBrief(id) {
+  const u = await users.findById(id);
+  return u ? { id: u.id, username: u.username, level: u.level } : { id, username: '(حساب حذف شده)', level: 0 };
+}
+app.get('/api/friends', authRequired, async (req, res) => {
+  try {
+    const [friendIds, incomingIds, outgoingIds] = await Promise.all([
+      friends.listFriends(req.user.id),
+      friends.listIncomingRequests(req.user.id),
+      friends.listOutgoingRequests(req.user.id),
+    ]);
+    const [friendsList, incoming, outgoing] = await Promise.all([
+      Promise.all(friendIds.map(friendUserBrief)),
+      Promise.all(incomingIds.map(friendUserBrief)),
+      Promise.all(outgoingIds.map(friendUserBrief)),
+    ]);
+    res.json({ friends: friendsList, incoming, outgoing });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول friendships رو تو Supabase ساختی؟' }); }
+});
+app.post('/api/friends/request', authRequired, async (req, res) => {
+  try {
+    const username = String((req.body && req.body.username) || '').trim();
+    if (!username) return res.status(400).json({ error: 'یوزرنیم رو بفرست' });
+    const target = await users.findByUsername(username);
+    if (!target) return res.status(404).json({ error: 'کاربری با این یوزرنیم پیدا نشد' });
+    const result = await friends.sendRequest(req.user.id, target.id);
+    if (result.error) return res.status(400).json({ error: result.error });
+    res.json(result);
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول friendships رو تو Supabase ساختی؟' }); }
+});
+app.post('/api/friends/respond', authRequired, async (req, res) => {
+  try {
+    const otherId = parseInt((req.body && req.body.userId) || 0);
+    const accept = !!(req.body && req.body.accept);
+    if (!otherId) return res.status(400).json({ error: 'کاربر نامشخص است' });
+    const result = await friends.respondToRequest(req.user.id, otherId, accept);
+    if (result.error) return res.status(400).json({ error: result.error });
+    res.json(result);
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.delete('/api/friends/:id', authRequired, async (req, res) => {
+  try {
+    const otherId = parseInt(req.params.id);
+    await friends.removeFriend(req.user.id, otherId);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
 app.get('/api/stages', (req, res) => {
   res.json({ stages: allStages().map(s => ({ id: s.id, name: s.name, wordCount: s.words.length })) });
 });
@@ -154,6 +243,7 @@ app.post('/api/stage/:id/check', authRequired, async (req, res) => {
     progress.add(word);
     const stageProgress = Object.assign({}, user.stageProgress, { [stage.id]: Array.from(progress) });
     const allFound = stage.words.every(w => progress.has(w));
+    progression.incrementProgress(user.id, 'find_word', 1).catch(e => console.error('progress err', e.message));
 
     let reward = { coins: 0, xp: 0 };
     let patch = { stageProgress };
@@ -169,6 +259,7 @@ app.post('/api/stage/:id/check', authRequired, async (req, res) => {
       if (stage.id === user.unlockedStage && user.unlockedStage < STAGES.length) {
         patch.unlockedStage = user.unlockedStage + 1;
       }
+      progression.incrementProgress(user.id, 'complete_stage', 1).catch(e => console.error('progress err', e.message));
     }
 
     const updated = await users.updateUser(user.id, patch);
@@ -238,23 +329,26 @@ app.get('/api/leaderboard', async (req, res) => {
 // To make someone an owner, run this once in Supabase SQL Editor:
 //   update users set role = 'owner' where username = 'their_username';
 function ownerRequired(req, res, next) {
-  authRequired(req, res, () => {
-    if (req.user.role !== 'owner' && req.user.role !== 'creator') {
+  authRequired(req, res, async () => {
+    const user = await requireFreshUser(req, res); if (!user) return;
+    if (user.role !== 'owner' && user.role !== 'creator') {
       return res.status(403).json({ error: 'فقط سازنده/مدیر اصلی دسترسی دارد' });
     }
     next();
   });
 }
 function testerRequired(req, res, next) {
-  authRequired(req, res, () => {
-    const ok = ['tester', 'owner', 'creator'].includes(req.user.role);
+  authRequired(req, res, async () => {
+    const user = await requireFreshUser(req, res); if (!user) return;
+    const ok = ['tester', 'owner', 'creator'].includes(user.role);
     if (!ok) return res.status(403).json({ error: 'دسترسی پنل تستر لازم است' });
     next();
   });
 }
 function inspectorRequired(req, res, next) {
-  authRequired(req, res, () => {
-    const ok = ['inspector', 'owner', 'creator'].includes(req.user.role);
+  authRequired(req, res, async () => {
+    const user = await requireFreshUser(req, res); if (!user) return;
+    const ok = ['inspector', 'owner', 'creator'].includes(user.role);
     if (!ok) return res.status(403).json({ error: 'دسترسی پنل بازرسی لازم است' });
     next();
   });
@@ -382,6 +476,40 @@ app.post('/api/admin/players/:id/gems', adminRequired, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
+// XP change — mirrors the coins/gems adjust endpoints, but keeps level in sync with xp
+// the same way normal stage-completion rewards do (via applyXp), instead of just writing
+// a raw xp number that could leave a player's level and xp inconsistent with each other.
+app.post('/api/admin/players/:id/xp', adminRequired, async (req, res) => {
+  try {
+    const target = await users.findById(parseInt(req.params.id));
+    if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    const delta = parseInt(req.body.delta) || 0;
+    const temp = { xp: target.xp, level: target.level };
+    if (delta >= 0) applyXp(temp, delta);
+    else temp.xp = Math.max(0, temp.xp + delta); // moving xp backwards never drops the level automatically
+    const updated = await users.updateUser(target.id, { xp: temp.xp, level: Math.max(1, temp.level) });
+    logAudit(req.user.username, 'XP_ADJUST', `player #${target.id} delta=${delta}`);
+    res.json({ user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+// "جان" (hearts) — the game already tracks extra hearts bought from the shop in
+// inventory.extraHearts (see SHOP_ITEMS below), so admin adjustment reuses that same
+// field instead of inventing a second, disconnected notion of hearts.
+app.post('/api/admin/players/:id/hearts', adminRequired, async (req, res) => {
+  try {
+    const target = await users.findById(parseInt(req.params.id));
+    if (!target) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    const delta = parseInt(req.body.delta) || 0;
+    const inventory = Object.assign({}, target.inventory, {
+      extraHearts: Math.max(0, (target.inventory?.extraHearts || 0) + delta)
+    });
+    const updated = await users.updateUser(target.id, { inventory });
+    logAudit(req.user.username, 'HEARTS_ADJUST', `player #${target.id} delta=${delta}`);
+    res.json({ user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
 const VALID_ROLES = ['player', 'tester', 'inspector', 'moderator', 'owner', 'creator'];
 app.post('/api/admin/players/:id/role', ownerRequired, async (req, res) => {
   try {
@@ -428,9 +556,15 @@ const presence = new Map(); // userId -> { status: 'online'|'playing', socketId 
 const userSockets = new Map(); // userId -> Set<socket> — for direct group/DM delivery
 function setPresence(userId, status) { presence.set(userId, { status, at: Date.now() }); }
 io.on('connection', (socket) => {
-  socket.on('chat:auth', (token) => {
+  socket.on('chat:auth', async (token) => {
     try {
-      socket.data.user = jwt.verify(token, JWT_SECRET);
+      const payload = jwt.verify(token, JWT_SECRET);
+      // Trust the DB's role/ban status at auth time, not whatever the token happened
+      // to carry (a role change or ban shouldn't wait up to 30 days for the JWT to expire).
+      const dbUser = await users.findById(payload.id);
+      if (!dbUser) return socket.emit('chat:error', 'حساب پیدا نشد');
+      if (dbUser.banned) return socket.emit('chat:error', 'حساب شما مسدود شده است');
+      socket.data.user = { id: dbUser.id, username: dbUser.username, role: dbUser.role };
       socket.emit('chat:authed', { username: socket.data.user.username });
       setPresence(socket.data.user.id, 'online');
       if (!userSockets.has(socket.data.user.id)) userSockets.set(socket.data.user.id, new Set());
@@ -443,10 +577,14 @@ io.on('connection', (socket) => {
   socket.on('chat:send', async ({ room, text } = {}) => {
     const user = socket.data.user;
     if (!user) return socket.emit('chat:error', 'ابتدا وارد شوید');
+    // A ban issued after this socket connected must still take effect immediately —
+    // re-check fresh, not just whatever was true when this socket authed.
+    const freshSender = await users.findById(user.id).catch(() => null);
+    if (!freshSender || freshSender.banned) return socket.emit('chat:error', 'حساب شما مسدود شده است');
     const now = Date.now();
     if (now - (lastMessageAt.get(socket.id) || 0) < 1200) return;
     lastMessageAt.set(socket.id, now);
-    const clean = String(text || '').slice(0, 300).trim();
+    const clean = profanity.censorText(String(text || '').slice(0, 300).trim());
     if (!clean) return;
     room = String(room || 'public');
     try {
@@ -496,7 +634,10 @@ io.on('connection', (socket) => {
   });
   socket.on('group:create', async ({ name } = {}, cb) => {
     const user = socket.data.user; if (!user) return cb && cb({ error: 'ابتدا وارد شوید' });
+    const freshCreator = await users.findById(user.id).catch(() => null);
+    if (!freshCreator || freshCreator.banned) return cb && cb({ error: 'حساب شما مسدود شده است' });
     if (!name || !name.trim()) return cb && cb({ error: 'اسم گروه رو بنویس' });
+    if (profanity.containsProfanity(name)) return cb && cb({ error: 'این اسم گروه مجاز نیست' });
     try { const group = await chat.createGroup(name.trim(), user.id); cb && cb({ group }); }
     catch (e) { console.error(e); cb && cb({ error: 'ساخت گروه انجام نشد' }); }
   });
@@ -517,7 +658,7 @@ io.on('connection', (socket) => {
   });
   socket.on('chat:report', async ({ messageId, reason } = {}) => {
     const user = socket.data.user; if (!user) return;
-    try { await chat.saveReport({ reporterId: user.id, messageId, reason }); }
+    try { await chat.saveReport({ reporterId: user.id, reporterUsername: user.username, messageId, reason }); }
     catch (e) { console.error(e); }
   });
   socket.on('battle:join', ({ level } = {}) => {
@@ -539,19 +680,19 @@ io.on('connection', (socket) => {
     const scores = {}; for (const pid of battle.players) scores[pid] = (battle.solved[pid] || new Set()).size;
     io.to(battle.room).emit('battle:score', scores);
     cb && cb({ correct });
-    if (correct && battle.solved[user.id].size >= battle.riddles.length) {
-      finishBattle(battleId, user.id);
+    // Finishing first (all 5 correct) locks YOUR result in, but the reveal to both
+    // players only happens once the opponent has also finished — no early spoilers.
+    if (correct && battle.solved[user.id].size >= battle.riddles.length && !battle.completions[user.id]) {
+      battle.completions[user.id] = { n: battle.solved[user.id].size, at: Date.now() };
+      io.to(socket.id).emit('battle:you_finished');
+      maybeResolveBattle(battleId);
     }
   });
   socket.on('battle:finish', async ({ battleId }) => {
     const battle = activeBattles[battleId]; if (!battle || battle.finished) return;
-    battle.finishedPlayers.add(socket.data.user?.id);
-    if (battle.finishedPlayers.size >= battle.players.length) {
-      const scores = battle.players.map(pid => ({ pid, n: (battle.solved[pid] || new Set()).size }));
-      scores.sort((a, b) => b.n - a.n);
-      const winnerId = scores[0].n === scores[1]?.n ? null : scores[0].pid;
-      finishBattle(battleId, winnerId);
-    }
+    const pid = socket.data.user?.id; if (!pid || battle.completions[pid]) return;
+    battle.completions[pid] = { n: (battle.solved[pid] || new Set()).size, at: Date.now() };
+    maybeResolveBattle(battleId);
   });
   socket.on('disconnect', () => {
     ['green', 'yellow', 'red'].forEach(l => { const idx = battleQueues[l].indexOf(socket); if (idx !== -1) battleQueues[l].splice(idx, 1); });
@@ -573,7 +714,7 @@ function tryMatch(level) {
     const stageRiddles = riddles.pickFive(level);
     activeBattles[battleId] = {
       room, level, players: [a.data.user.id, b.data.user.id],
-      riddles: stageRiddles, solved: {}, finishedPlayers: new Set(), finished: false,
+      riddles: stageRiddles, solved: {}, completions: {}, finished: false,
     };
     setPresence(a.data.user.id, 'playing'); setPresence(b.data.user.id, 'playing');
     const publicRiddles = stageRiddles.map(r => ({ id: r.id, question: r.question }));
@@ -582,6 +723,14 @@ function tryMatch(level) {
       opponents: [{ id: a.data.user.id, username: a.data.user.username }, { id: b.data.user.id, username: b.data.user.username }]
     });
   }
+}
+function maybeResolveBattle(battleId) {
+  const battle = activeBattles[battleId]; if (!battle || battle.finished) return;
+  if (Object.keys(battle.completions).length < battle.players.length) return; // wait for both — no early spoilers
+  const results = battle.players.map(pid => ({ pid, ...(battle.completions[pid] || { n: (battle.solved[pid] || new Set()).size, at: Infinity }) }));
+  results.sort((x, y) => (y.n - x.n) || (x.at - y.at)); // higher score wins; tie broken by who finished first
+  const winnerId = results[0].n === results[1].n ? null : results[0].pid;
+  finishBattle(battleId, winnerId);
 }
 async function finishBattle(battleId, winnerId) {
   const battle = activeBattles[battleId]; if (!battle || battle.finished) return;
@@ -595,6 +744,7 @@ async function finishBattle(battleId, winnerId) {
         const tempUser = { xp: winner.xp, level: winner.level };
         applyXp(tempUser, 40);
         await users.updateUser(winnerId, { coins: winner.coins + reward.coins, gems: (winner.gems || 0) + reward.gems, xp: tempUser.xp, level: tempUser.level });
+        progression.incrementProgress(winnerId, 'win_battle', 1).catch(e => console.error('progress err', e.message));
       }
     } catch (e) { console.error(e); }
   }
@@ -607,7 +757,7 @@ app.post('/api/tester/bugs', testerRequired, async (req, res) => {
   const description = String((req.body && req.body.description) || '').slice(0, 1000).trim();
   if (!description) return res.status(400).json({ error: 'توضیح باگ خالیه' });
   try {
-    await chat.saveReport({ reporterId: req.user.id, messageId: null, reason: 'BUG: ' + description });
+    await chat.saveReport({ reporterId: req.user.id, reporterUsername: req.user.username, messageId: null, reason: 'BUG: ' + description });
     res.json({ ok: true });
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
@@ -624,6 +774,71 @@ app.post('/api/tester/reset', testerRequired, async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// ================= EVENTS + DAILY MISSIONS + DAILY REWARD (real, server-verified) =================
+app.get('/api/progress', authRequired, async (req, res) => {
+  try { res.json(await progression.getUserBoard(req.user.id)); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.post('/api/progress/claim', authRequired, async (req, res) => {
+  try {
+    const { itemType, itemId } = req.body || {};
+    if (!['event', 'mission'].includes(itemType)) return res.status(400).json({ error: 'نوع نامعتبر' });
+    const result = await progression.claimProgress(req.user.id, itemType, parseInt(itemId));
+    if (result.error) return res.status(400).json({ error: result.error });
+    const user = await users.findById(req.user.id);
+    const updated = await users.updateUser(user.id, { coins: user.coins + result.rewardCoins, gems: (user.gems || 0) + result.rewardGems });
+    res.json({ ok: true, user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.get('/api/daily-reward', authRequired, async (req, res) => {
+  try { res.json(await progression.getDailyStatus(req.user.id)); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.post('/api/daily-reward/claim', authRequired, async (req, res) => {
+  try {
+    const result = await progression.claimDailyReward(req.user.id);
+    if (result.error) return res.status(400).json({ error: result.error });
+    const user = await users.findById(req.user.id);
+    const updated = await users.updateUser(user.id, { coins: user.coins + result.coins, gems: (user.gems || 0) + result.gems });
+    res.json({ ok: true, streak: result.streak, coins: result.coins, gems: result.gems, user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.post('/api/admin/events', ownerRequired, async (req, res) => {
+  try {
+    const { title, description, type, target, rewardCoins, rewardGems } = req.body || {};
+    if (!title || !type || !target) return res.status(400).json({ error: 'اسم، نوع و هدف رو پر کن' });
+    const event = await progression.createEvent({ title, description, type, target: parseInt(target), rewardCoins: parseInt(rewardCoins) || 0, rewardGems: parseInt(rewardGems) || 0 });
+    logAudit(req.user.username, 'CREATE_EVENT', `event #${event.id} (${title})`);
+    res.json({ event });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.post('/api/admin/missions', ownerRequired, async (req, res) => {
+  try {
+    const { title, description, type, target, rewardCoins, rewardGems } = req.body || {};
+    if (!title || !type || !target) return res.status(400).json({ error: 'اسم، نوع و هدف رو پر کن' });
+    const mission = await progression.createMission({ title, description, type, target: parseInt(target), rewardCoins: parseInt(rewardCoins) || 0, rewardGems: parseInt(rewardGems) || 0 });
+    logAudit(req.user.username, 'CREATE_MISSION', `mission #${mission.id} (${title})`);
+    res.json({ mission });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.post('/api/admin/events/:id/toggle', ownerRequired, async (req, res) => {
+  try { await progression.toggleEvent(parseInt(req.params.id), !!req.body.active); res.json({ ok: true }); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.post('/api/admin/missions/:id/toggle', ownerRequired, async (req, res) => {
+  try { await progression.toggleMission(parseInt(req.params.id), !!req.body.active); res.json({ ok: true }); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.get('/api/admin/events', adminRequired, async (req, res) => {
+  try { res.json({ events: await progression.listActiveEvents() }); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.get('/api/admin/missions', adminRequired, async (req, res) => {
+  try { res.json({ missions: await progression.listActiveMissions() }); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
 
 // ================= MAINTENANCE MODE (real — replaces the old fake test-mode button) =================
 app.get('/api/maintenance/status', async (req, res) => {

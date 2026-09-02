@@ -10,6 +10,12 @@
 - `public/admin/index.html` — پنل مدیریت وب (با ورود جدا از بازیکن‌ها)
 - `.env.example` — نمونه‌ی تنظیمات امن (رمزها را اینجا ننویس، در `.env` واقعی بنویس)
 
+## 🔐 امنیت — یه کار دستی مهم روی Render
+تو Render → Environment، یه متغیر به اسم `JWT_SECRET` بساز و یه رشته‌ی طولانی و رندوم بذار
+(مثلاً ۴۰-۶۴ کاراکتر تصادفی). بدون این کار، سرور خودش موقع روشن شدن یه رمز رندوم می‌سازه —
+امن هست ولی هر بار که سرور ری‌استارت بشه، همه از حساب‌شون خارج می‌شن. با یه JWT_SECRET
+ثابت، این اتفاق نمی‌افته.
+
 ## ⚠️ یه کار دستی لازم (فقط یک بار) — اضافه کردن ستون جم
 این نسخه واحد پول «جم» و «کوله‌پشتی آیتم‌ها» رو اضافه کرده. چون حساب‌ها روی Supabase
 ذخیره می‌شن، باید یه بار این دستور رو تو **Supabase → SQL Editor** اجرا کنی:
@@ -48,10 +54,50 @@ create table if not exists chat_group_members (
 create table if not exists chat_reports (
   id bigserial primary key,
   reporter_id integer not null,
+  reporter_username text,
+  reported_username text,
   message_id bigint,
   reason text,
   status text default 'open',
   created_at timestamptz default now()
+);
+alter table chat_reports add column if not exists reporter_username text;
+alter table chat_reports add column if not exists reported_username text;
+
+create table if not exists game_events (
+  id bigserial primary key,
+  title text not null,
+  description text,
+  type text not null,
+  target integer not null default 1,
+  reward_coins integer default 0,
+  reward_gems integer default 0,
+  active boolean default true,
+  created_at timestamptz default now()
+);
+create table if not exists daily_missions (
+  id bigserial primary key,
+  title text not null,
+  description text,
+  type text not null,
+  target integer not null default 1,
+  reward_coins integer default 0,
+  reward_gems integer default 0,
+  active boolean default true
+);
+create table if not exists progress_log (
+  user_id integer not null,
+  item_type text not null,
+  item_id bigint not null,
+  day date not null,
+  progress integer default 0,
+  claimed boolean default false,
+  primary key (user_id, item_type, item_id, day)
+);
+create table if not exists daily_rewards (
+  user_id integer primary key,
+  streak integer default 0,
+  last_claim date
 );
 
 create table if not exists custom_stages (
@@ -61,12 +107,39 @@ create table if not exists custom_stages (
   name text not null,
   char jsonb not null
 );
+
+create table if not exists friendships (
+  user_a integer not null,
+  user_b integer not null,
+  status text not null default 'pending', -- 'pending' | 'accepted'
+  requested_by integer not null,
+  created_at timestamptz default now(),
+  primary key (user_a, user_b)
+);
 ```
+
+این جدول آخر (`friendships`) لازمه تا بخش «دوستان» واقعاً کار کنه — قبلاً فقط تو حافظه‌ی
+مرورگر خود گوشی ذخیره می‌شد (نه رو سرور)، برای همین هیچ‌وقت واقعاً به طرف مقابل درخواست
+دوستی نمی‌رسید. بدون این جدول، دکمه‌های دوستان خطای «جدول friendships رو تو Supabase
+ساختی؟» می‌دن.
 
 این جدول‌های جدید باعث می‌شن چت (همگانی، گروهی، خصوصی) و گزارش‌ها واقعاً رو سرور ذخیره بشن —
 قبلاً رو یه فایل محلی بودن که هر بار سرور ری‌استارت/آپدیت می‌شد، پاک می‌شدن.
 
 بدون این کار، سرور موقع ذخیره‌ی جم یا آیتم‌های خریداری‌شده خطا می‌ده.
+
+## جلوگیری از خواب رفتن سرور (رایگان)
+پلن رایگان Render بعد از ~۱۵ دقیقه بدون درخواست ورودی می‌خوابه و بیدار شدنش ۲۰-۵۰+ ثانیه طول می‌کشه.
+خود بازی هر ۵ دقیقه یه پینگ می‌فرسته، ولی این فقط وقتی کار می‌کنه که حداقل یه نفر بازی رو باز داشته باشه.
+برای این‌که سرور **همیشه** بیدار بمونه (حتی وقتی هیچ‌کس بازی رو باز نکرده)، یکی از این سرویس‌های رایگان رو تنظیم کن:
+
+1. برو **uptimerobot.com** یا **cron-job.org** و ثبت‌نام کن (رایگان، نیاز به کارت بانکی نداره)
+2. یه Monitor/Job جدید بساز
+3. آدرس رو بذار: `https://api.mirzakhan.ir/api/health`
+4. فاصله‌ی زمانی رو بذار روی **هر ۵ یا ۱۰ دقیقه**
+5. ذخیره کن
+
+از این به بعد، این سرویس هر چند دقیقه یه‌بار به سرور سر می‌زنه و اجازه نمی‌ده کامل بخوابه.
 
 ## برای این‌که یه حساب، مدیر اصلی (owner) بشه — یه بار دستی
 ```sql

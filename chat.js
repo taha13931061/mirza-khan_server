@@ -44,9 +44,15 @@ async function getHistory(room, limit = 50) {
   }));
 }
 
-async function saveReport({ reporterId, messageId, reason }) {
+async function saveReport({ reporterId, reporterUsername, messageId, reason }) {
+  let reportedUsername = null;
+  if (messageId) {
+    const { data: msg } = await getClient().from('chat_messages').select('sender_username').eq('id', messageId).maybeSingle();
+    if (msg) reportedUsername = msg.sender_username;
+  }
   const { error } = await getClient().from('chat_reports').insert({
-    reporter_id: reporterId, message_id: messageId, reason: String(reason || '').slice(0, 200)
+    reporter_id: reporterId, reporter_username: reporterUsername || null,
+    reported_username: reportedUsername, message_id: messageId, reason: String(reason || '').slice(0, 200)
   });
   if (error) throw error;
 }
@@ -54,7 +60,11 @@ async function saveReport({ reporterId, messageId, reason }) {
 async function listReports() {
   const { data, error } = await getClient().from('chat_reports').select('*').order('created_at', { ascending: false }).limit(100);
   if (error) throw error;
-  return (data || []).map(r => ({ id: r.id, reporterId: r.reporter_id, messageId: r.message_id, reason: r.reason, status: r.status, createdAt: r.created_at }));
+  return (data || []).map(r => ({
+    id: r.id, reporterId: r.reporter_id, reporterUsername: r.reporter_username || null,
+    reportedUsername: r.reported_username || null, messageId: r.message_id,
+    reason: r.reason, status: r.status, createdAt: r.created_at
+  }));
 }
 
 async function resolveReport(id) {

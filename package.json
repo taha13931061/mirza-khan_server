@@ -12,6 +12,7 @@
     "jsonwebtoken": "^9.0.2",
     "bcryptjs": "^2.4.3",
     "socket.io": "^4.7.5",
+    "express-rate-limit": "^7.4.0",
     "dotenv": "^16.4.5",
     "@supabase/supabase-js": "^2.45.4"
   },
