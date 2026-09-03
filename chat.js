@@ -33,15 +33,54 @@ async function saveMessage({ room, senderId, senderUsername, text }) {
   };
 }
 
+async function listRecentMessages(limit = 1000) {
+  const { data, error } = await getClient().from('chat_messages').select('*')
+    .order('created_at', { ascending: false }).limit(limit);
+  if (error) throw error;
+  return (data || []).map(m => ({
+    id: m.id, room: m.room, userId: m.sender_id,
+    username: m.sender_username, text: m.text, createdAt: m.created_at
+  }));
+}
+
+async function updateMessageText(id, text) {
+  const { error } = await getClient().from('chat_messages').update({ text }).eq('id', id);
+  if (error) throw error;
+}
+
+async function deleteMessage(id) {
+  const { error } = await getClient().from('chat_messages').delete().eq('id', id);
+  if (error) throw error;
+}
 async function getHistory(room, limit = 50) {
-  const { data, error } = await getClient()
-    .from('chat_messages').select('*').eq('room', room)
+  const { data, error } = await getClient().from('chat_messages').select('*').eq('room', room)
     .order('created_at', { ascending: false }).limit(limit);
   if (error) throw error;
   return (data || []).reverse().map(m => ({
     id: m.id, room: m.room, userId: m.sender_id,
     username: m.sender_username, text: m.text, createdAt: m.created_at
   }));
+}
+
+// Recent DM inbox for one user — scans the last `limit` private messages system-wide and
+// keeps only the newest one per conversation the user is part of. Good enough for a
+// personal-scale game; if this ever needs to scale much further, a dedicated
+// "conversations" table updated on every send would replace this scan.
+async function listDmConversations(userId, limit = 500) {
+  const { data, error } = await getClient().from('chat_messages').select('*')
+    .like('room', 'dm:%').order('created_at', { ascending: false }).limit(limit);
+  if (error) throw error;
+  const seen = new Map(); // room -> most recent message row (input is already newest-first)
+  for (const m of (data || [])) {
+    const parts = m.room.slice(3).split('-').map(Number);
+    if (!parts.includes(userId)) continue;
+    if (!seen.has(m.room)) seen.set(m.room, m);
+  }
+  return Array.from(seen.entries()).map(([room, m]) => {
+    const parts = room.slice(3).split('-').map(Number);
+    const otherId = parts.find(id => id !== userId);
+    return { room, otherId, lastText: m.text, lastAt: m.created_at, lastSenderId: m.sender_id };
+  });
 }
 
 async function saveReport({ reporterId, reporterUsername, messageId, reason }) {
@@ -130,6 +169,21 @@ async function listAllGroups(limit = 100) {
   return (data || []).map(g => ({ id: g.id, name: g.name, creatorId: g.creator_id }));
 }
 
+async function renameGroup(id, name) {
+  const { data, error } = await getClient().from('chat_groups').update({ name: String(name || '').slice(0, 60) }).eq('id', id).select().single();
+  if (error) throw error;
+  return { id: data.id, name: data.name, creatorId: data.creator_id };
+}
+
+async function deleteGroup(id) {
+  // no FK cascade assumed — clean up dependent rows by hand before dropping the group itself
+  const client = getClient();
+  await client.from('chat_messages').delete().eq('room', `group:${id}`);
+  await client.from('chat_group_members').delete().eq('group_id', id);
+  const { error } = await client.from('chat_groups').delete().eq('id', id);
+  if (error) throw error;
+}
+
 async function listCustomStages() {
   const { data, error } = await getClient().from('custom_stages').select('*').order('id', { ascending: true });
   if (error) throw error;
@@ -144,7 +198,8 @@ async function addCustomStage({ id, letters, words, name, char }) {
 }
 
 module.exports = {
-  dmRoom, saveMessage, getHistory, saveReport, listReports, resolveReport, countOpenReports, countMessages,
-  createGroup, joinGroup, isGroupMember, getGroupMembers, listUserGroups, listAllGroups,
+  dmRoom, saveMessage, getHistory, listDmConversations, listRecentMessages, updateMessageText, deleteMessage,
+  saveReport, listReports, resolveReport, countOpenReports, countMessages,
+  createGroup, joinGroup, isGroupMember, getGroupMembers, listUserGroups, listAllGroups, renameGroup, deleteGroup,
   listCustomStages, addCustomStage
 };

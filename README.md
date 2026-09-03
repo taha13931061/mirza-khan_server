@@ -123,6 +123,37 @@ create table if not exists friendships (
 دوستی نمی‌رسید. بدون این جدول، دکمه‌های دوستان خطای «جدول friendships رو تو Supabase
 ساختی؟» می‌دن.
 
+```sql
+create table if not exists battle_history (
+  id bigserial primary key,
+  battle_id text not null,
+  level text not null,
+  player_id integer not null,
+  opponent_id integer,
+  opponent_username text,
+  result text not null, -- 'win' | 'loss' | 'draw'
+  score integer not null default 0,
+  opponent_score integer not null default 0,
+  created_at timestamptz default now()
+);
+create index if not exists battle_history_player_idx on battle_history(player_id, created_at desc);
+```
+
+این جدول تاریخچه‌ی مبارزات آنلاین رو نگه می‌داره — هم برای «مبارزات اخیر من» تو پروفایل،
+هم برای جدول امتیازات بر اساس تعداد برد. بدون این جدول، هر دو خطای «جدول battle_history
+رو تو Supabase ساختی؟» می‌دن (ولی خود مبارزه‌ها و جایزه‌شون عادی کار می‌کنن — فقط ثبت
+تاریخچه انجام نمی‌شه).
+
+```sql
+alter table app_settings add column if not exists min_version text;
+alter table app_settings add column if not exists update_url text;
+alter table app_settings add column if not exists update_message text;
+```
+
+این سه ستون به همون جدول `app_settings` (که برای حالت خاموشی/تعمیرات استفاده می‌شد) اضافه
+می‌شن و پایه‌ی سیستم «بروزرسانی اجباری» هستن — از پنل مدیریت، بخش «🔄 نسخه اپ»، حداقل
+نسخه‌ی مجاز و لینک مایکت رو تنظیم کن.
+
 این جدول‌های جدید باعث می‌شن چت (همگانی، گروهی، خصوصی) و گزارش‌ها واقعاً رو سرور ذخیره بشن —
 قبلاً رو یه فایل محلی بودن که هر بار سرور ری‌استارت/آپدیت می‌شد، پاک می‌شدن.
 

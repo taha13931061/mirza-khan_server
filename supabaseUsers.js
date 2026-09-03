@@ -130,9 +130,28 @@ async function setMaintenance({ enabled, reason, endsAt }) {
   return { enabled: !!enabled, reason: reason || '', endsAt: endsAt || null };
 }
 
+// ===== Forced app-version gate — same row (id=1) as maintenance mode, different columns =====
+async function getVersionConfig() {
+  const { data, error } = await getClient().from('app_settings').select('*').eq('id', 1).maybeSingle();
+  if (error) throw error;
+  if (!data) return { minVersion: '0.0.0', updateUrl: '', updateMessage: '' };
+  return {
+    minVersion: data.min_version || '0.0.0',
+    updateUrl: data.update_url || '',
+    updateMessage: data.update_message || ''
+  };
+}
+async function setVersionConfig({ minVersion, updateUrl, updateMessage }) {
+  const { error } = await getClient().from('app_settings').upsert({
+    id: 1, min_version: minVersion || '0.0.0', update_url: updateUrl || '', update_message: updateMessage || ''
+  });
+  if (error) throw error;
+  return { minVersion: minVersion || '0.0.0', updateUrl: updateUrl || '', updateMessage: updateMessage || '' };
+}
+
 async function deleteUser(id) {
   const { error } = await getClient().from('users').delete().eq('id', id);
   if (error) throw error;
 }
 
-module.exports = { findByUsername, findById, createUser, updateUser, deleteUser, listAll, getMaintenance, setMaintenance };
+module.exports = { findByUsername, findById, createUser, updateUser, deleteUser, listAll, getMaintenance, setMaintenance, getVersionConfig, setVersionConfig };

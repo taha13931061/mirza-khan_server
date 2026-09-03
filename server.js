@@ -16,6 +16,7 @@ const riddles = require('./riddles');
 const progression = require('./progression');
 const profanity = require('./profanityFilter'); // filters cursing in chat text, group names, usernames
 const friends = require('./friends');           // real friends system (Supabase — replaces the old localStorage-only list)
+const battles = require('./battles');            // persistent battle history + wins leaderboard
 let customStages = []; // loaded from Supabase at boot — lets the owner add stages without a redeploy
 async function reloadCustomStages() { try { customStages = await chat.listCustomStages(); } catch (e) { console.error('custom stages load failed', e.message); } }
 function findStage(id) { return STAGES.find(s => s.id === id) || customStages.find(s => s.id === id); }
@@ -200,6 +201,109 @@ app.delete('/api/friends/:id', authRequired, async (req, res) => {
     await friends.removeFriend(req.user.id, otherId);
     res.json({ ok: true });
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+// ================= CHAT GROUPS — moderation (existing groups made before the profanity
+// filter existed aren't touched retroactively by it, so this is how those get cleaned up) =================
+// ================= CHAT MESSAGES — moderation (retroactive cleanup, since the profanity
+// filter only stops NEW messages; it never touched what was already stored) =================
+app.get('/api/admin/messages', adminRequired, async (req, res) => {
+  try {
+    const room = req.query.room ? String(req.query.room) : null;
+    const onlyFlagged = req.query.flagged !== 'false';
+    let msgs = await chat.listRecentMessages(1000);
+    if (room) msgs = msgs.filter(m => m.room === room);
+    const withFlags = msgs.map(m => ({ ...m, flagged: profanity.containsProfanity(m.text) }));
+    res.json({ messages: onlyFlagged ? withFlags.filter(m => m.flagged) : withFlags });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.delete('/api/admin/messages/:id', adminRequired, async (req, res) => {
+  try {
+    await chat.deleteMessage(parseInt(req.params.id));
+    logAudit(req.user.username, 'MESSAGE_DELETE', `message #${req.params.id}`);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+// Bulk pass: re-runs the current profanity filter over stored history (public + group +
+// private) and masks anything that matches, same as if it had been sent after the filter
+// existed. Capped at the last 5000 messages per run — re-run again for older history.
+app.post('/api/admin/messages/clean', adminRequired, async (req, res) => {
+  try {
+    const msgs = await chat.listRecentMessages(5000);
+    let changed = 0;
+    for (const m of msgs) {
+      const clean = profanity.censorText(m.text);
+      if (clean !== m.text) { await chat.updateMessageText(m.id, clean); changed++; }
+    }
+    logAudit(req.user.username, 'MESSAGES_BULK_CLEAN', `checked=${msgs.length} changed=${changed}`);
+    res.json({ checked: msgs.length, changed });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+app.get('/api/admin/groups', adminRequired, async (req, res) => {
+  try {
+    const groups = await chat.listAllGroups(500);
+    const flagged = groups.map(g => ({ ...g, flagged: profanity.containsProfanity(g.name) }));
+    res.json({ groups: flagged });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.post('/api/admin/groups/:id/rename', adminRequired, async (req, res) => {
+  try {
+    const name = String((req.body && req.body.name) || '').trim();
+    if (!name) return res.status(400).json({ error: 'اسم جدید رو بفرست' });
+    if (profanity.containsProfanity(name)) return res.status(400).json({ error: 'این اسم هم مجاز نیست' });
+    const group = await chat.renameGroup(parseInt(req.params.id), name);
+    logAudit(req.user.username, 'GROUP_RENAME', `group #${group.id} -> "${group.name}"`);
+    res.json({ group });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+app.delete('/api/admin/groups/:id', adminRequired, async (req, res) => {
+  try {
+    await chat.deleteGroup(parseInt(req.params.id));
+    logAudit(req.user.username, 'GROUP_DELETE', `group #${req.params.id}`);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+app.get('/api/battles/history', authRequired, async (req, res) => {
+  try {
+    const history = await battles.getHistory(req.user.id, 10);
+    res.json({ history });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول battle_history رو تو Supabase ساختی؟' }); }
+});
+app.get('/api/battles/leaderboard', async (req, res) => {
+  try {
+    const rows = await battles.getWinsLeaderboard(20);
+    const withNames = await Promise.all(rows.map(async r => {
+      const u = await users.findById(r.playerId);
+      return { username: u ? u.username : '(حساب حذف شده)', wins: r.wins };
+    }));
+    res.json({ leaderboard: withNames });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول battle_history رو تو Supabase ساختی؟' }); }
+});
+
+// ================= FORCED APP UPDATE =================
+// One row (same app_settings row used for maintenance mode) holds the minimum client
+// version allowed to play. If the running client's baked-in version is below that, the
+// client shows a full-screen, non-dismissable "please update" screen with a button to
+// the Myket listing. Fails OPEN (never blocks play) if the config can't be read at all —
+// a Supabase hiccup here should never lock everyone out of a game they can't update yet.
+app.get('/api/version', async (req, res) => {
+  try {
+    const cfg = await users.getVersionConfig();
+    res.json(cfg);
+  } catch (e) { res.json({ minVersion: '0.0.0', updateUrl: '', updateMessage: '' }); }
+});
+app.post('/api/admin/version', ownerRequired, async (req, res) => {
+  try {
+    const minVersion = String((req.body && req.body.minVersion) || '').trim();
+    const updateUrl = String((req.body && req.body.updateUrl) || '').trim();
+    const updateMessage = String((req.body && req.body.updateMessage) || '').trim();
+    if (!minVersion) return res.status(400).json({ error: 'شماره نسخه رو بفرست' });
+    const cfg = await users.setVersionConfig({ minVersion, updateUrl, updateMessage });
+    logAudit(req.user.username, 'VERSION_SET', `minVersion=${cfg.minVersion} url=${cfg.updateUrl}`);
+    res.json({ config: cfg });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول app_settings رو تو Supabase ساختی؟' }); }
 });
 
 app.get('/api/stages', (req, res) => {
@@ -552,6 +656,31 @@ app.get('/api/admin/stats', adminRequired, async (req, res) => {
 });
 
 const lastMessageAt = new Map();
+// Auto-mute for repeat profanity offenders — separate from manual admin bans. Strikes
+// decay after CHAT_STRIKE_WINDOW_MS of clean chatting, so one bad night doesn't follow
+// someone forever; hitting the threshold mutes chat (not the account) for CHAT_MUTE_MS.
+const chatStrikes = new Map(); // userId -> { count, lastAt }
+const chatMuted = new Map();   // userId -> mutedUntil (epoch ms)
+const CHAT_STRIKE_WINDOW_MS = 30 * 60 * 1000;
+const CHAT_STRIKES_TO_MUTE = 3;
+const CHAT_MUTE_MS = 15 * 60 * 1000;
+function mkChatMuteRemaining(userId) {
+  const until = chatMuted.get(userId);
+  return until && until > Date.now() ? Math.ceil((until - Date.now()) / 60000) : 0;
+}
+function mkRegisterProfanityStrike(userId) {
+  const now = Date.now();
+  const s = chatStrikes.get(userId);
+  const fresh = (!s || now - s.lastAt > CHAT_STRIKE_WINDOW_MS) ? { count: 0, lastAt: now } : s;
+  fresh.count += 1; fresh.lastAt = now;
+  if (fresh.count >= CHAT_STRIKES_TO_MUTE) {
+    chatMuted.set(userId, now + CHAT_MUTE_MS);
+    chatStrikes.delete(userId);
+    return true; // just got muted
+  }
+  chatStrikes.set(userId, fresh);
+  return false;
+}
 const presence = new Map(); // userId -> { status: 'online'|'playing', socketId }
 const userSockets = new Map(); // userId -> Set<socket> — for direct group/DM delivery
 function setPresence(userId, status) { presence.set(userId, { status, at: Date.now() }); }
@@ -581,11 +710,18 @@ io.on('connection', (socket) => {
     // re-check fresh, not just whatever was true when this socket authed.
     const freshSender = await users.findById(user.id).catch(() => null);
     if (!freshSender || freshSender.banned) return socket.emit('chat:error', 'حساب شما مسدود شده است');
+    const mutedFor = mkChatMuteRemaining(user.id);
+    if (mutedFor > 0) return socket.emit('chat:error', `به‌خاطر فحاشی تکراری، چتت تا ${mutedFor} دقیقه‌ی دیگه مسدوده`);
     const now = Date.now();
     if (now - (lastMessageAt.get(socket.id) || 0) < 1200) return;
     lastMessageAt.set(socket.id, now);
-    const clean = profanity.censorText(String(text || '').slice(0, 300).trim());
+    const raw = String(text || '').slice(0, 300).trim();
+    const clean = profanity.censorText(raw);
     if (!clean) return;
+    if (clean !== raw) {
+      const justMuted = mkRegisterProfanityStrike(user.id);
+      if (justMuted) return socket.emit('chat:error', `به‌خاطر فحاشی تکراری، چتت به مدت ${Math.round(CHAT_MUTE_MS / 60000)} دقیقه مسدود شد`);
+    }
     room = String(room || 'public');
     try {
       let targetRoom = room;
@@ -630,6 +766,21 @@ io.on('connection', (socket) => {
       }
       const messages = await chat.getHistory(targetRoom);
       cb && cb({ messages });
+    } catch (e) { console.error(e); cb && cb({ error: 'خطای سرور' }); }
+  });
+  socket.on('chat:dm_list', async (_payload, cb) => {
+    const user = socket.data.user; if (!user) return cb && cb({ error: 'ابتدا وارد شوید' });
+    try {
+      const rows = await chat.listDmConversations(user.id, 500);
+      const conversations = await Promise.all(rows.map(async r => {
+        const other = await users.findById(r.otherId);
+        return {
+          otherId: r.otherId, otherUsername: other ? other.username : '(حساب حذف شده)',
+          lastText: r.lastText, lastAt: r.lastAt, lastFromMe: r.lastSenderId === user.id
+        };
+      }));
+      conversations.sort((a, b) => new Date(b.lastAt) - new Date(a.lastAt));
+      cb && cb({ conversations });
     } catch (e) { console.error(e); cb && cb({ error: 'خطای سرور' }); }
   });
   socket.on('group:create', async ({ name } = {}, cb) => {
@@ -714,6 +865,7 @@ function tryMatch(level) {
     const stageRiddles = riddles.pickFive(level);
     activeBattles[battleId] = {
       room, level, players: [a.data.user.id, b.data.user.id],
+      playerUsernames: { [a.data.user.id]: a.data.user.username, [b.data.user.id]: b.data.user.username },
       riddles: stageRiddles, solved: {}, completions: {}, finished: false,
     };
     setPresence(a.data.user.id, 'playing'); setPresence(b.data.user.id, 'playing');
@@ -749,6 +901,13 @@ async function finishBattle(battleId, winnerId) {
     } catch (e) { console.error(e); }
   }
   io.to(battle.room).emit('battle:result', { winnerId, scores, level: battle.level });
+  // Persist the match so "leaderboard by wins" and "my recent matches" have something to
+  // read — best-effort: a logging hiccup here should never stop the result from reaching
+  // the players or block their reward payout above.
+  try {
+    const players = battle.players.map(id => ({ id, username: battle.playerUsernames?.[id] || '?' }));
+    await battles.recordBattleResult({ battleId, level: battle.level, players, scores, winnerId });
+  } catch (e) { console.error('battle history log failed', e.message); }
   delete activeBattles[battleId];
 }
 
