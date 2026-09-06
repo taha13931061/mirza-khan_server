@@ -71,7 +71,7 @@ async function init(){
       return;
     }
     const me = await meRes.json();
-    userBox.innerHTML = خوش اومدی <b>${escapeHtml(me.user.username)}</b> — موجودی فعلی: 🪙 ${me.user.coins} — 💎 ${me.user.gems || 0};
+    userBox.innerHTML = `خوش اومدی <b>${escapeHtml(me.user.username)}</b> — موجودی فعلی: 🪙 ${me.user.coins} — 💎 ${me.user.gems || 0}`;
 
     const data = await pkgRes.json();
     if (data.sandbox) {
@@ -82,7 +82,9 @@ async function init(){
   } catch (e) {
     userBox.textContent = 'اتصال به سرور برقرار نشد — یه بار دیگه صفحه رو رفرش کن.';
   }
-}async function loadPackages(){
+}
+
+async function loadPackages(){
   try {
     const r = await fetchWithRetry('/api/store/packages');
     const data = await r.json();
@@ -98,12 +100,12 @@ async function init(){
 
 function renderPackages(packages){
   const box = document.getElementById('packages');
-  box.innerHTML = packages.map(p => 
+  box.innerHTML = packages.map(p => `
     <div class="card">
       <div class="info"><b>${p.type === 'gems' ? '💎' : '🪙'} ${escapeHtml(p.label)}</b><div>${p.priceToman.toLocaleString('fa-IR')} تومان</div></div>
       <button class="buy-btn" onclick="buy('${p.id}', this)">خرید</button>
     </div>
-  ).join('') || '<div style="text-align:center;color:#999">بسته‌ای برای فروش تعریف نشده.</div>';
+  `).join('') || '<div style="text-align:center;color:#999">بسته‌ای برای فروش تعریف نشده.</div>';
 }
 
 async function buy(packageId, btn){
@@ -138,7 +140,7 @@ async function buy(packageId, btn){
     const lookupData = await lookupRes.json();
     if (!lookupRes.ok) { status.style.color = '#ff9ab4'; status.textContent = lookupData.error || 'شناسه پیدا نشد'; btn.disabled = false; return; }
 
-    const proceed = confirm(این خرید برای حساب «${lookupData.username}» ثبت می‌شه. ادامه بدم؟);
+    const proceed = confirm(`این خرید برای حساب «${lookupData.username}» ثبت می‌شه. ادامه بدم؟`);
     if (!proceed) { status.textContent = ''; btn.disabled = false; return; }
 
     status.textContent = 'در حال اتصال به درگاه پرداخت...';
