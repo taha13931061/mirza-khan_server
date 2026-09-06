@@ -35,25 +35,44 @@ const params = new URLSearchParams(location.search);
 const token = params.get('token') || localStorage.getItem('mk_shop_token') || '';
 if (token) localStorage.setItem('mk_shop_token', token);
 
+async function fetchWithRetry(url, opts, attempts){
+  attempts = attempts || 3;
+  for (let i = 0; i < attempts; i++){
+    try { return await fetch(url, opts); }
+    catch (e) {
+      // The free-tier server can be asleep and take 20-50s to wake up on first hit —
+      // a short, growing wait between retries covers that without failing outright.
+      if (i === attempts - 1) throw e;
+      await new Promise(r => setTimeout(r, (i + 1) * 3000));
+    }
+  }
+}
+
 async function init(){
   const userBox = document.getElementById('userBox');
-  const status = document.getElementById('status');
   if (!token) {
-    userBox.textContent = 'برای خرید باید از داخل بازی وارد فروشگاه بشی.';
+    // No token — this is someone browsing the shop directly (Google, bookmark, shared
+    // link). Don't gate browsing behind a login step; show the catalog right away and
+    // only ask which account to credit once they actually click "خرید" on something.
+    userBox.textContent = 'برای خرید، وقتی رو «خرید» می‌زنی شناسه‌ت رو ازت می‌پرسه.';
+    loadPackages();
     return;
   }
+  userBox.textContent = 'در حال اتصال به سرور... (ممکنه چند ثانیه طول بکشه)';
   try {
-    const meRes = await fetch('/api/me', { headers: { Authorization: 'Bearer ' + token } });
-    if (!meRes.ok) { userBox.textContent = 'ورودت منقضی شده — از داخل بازی دوباره وارد فروشگاه شو.'; return; }
+    const [meRes, pkgRes] = await Promise.all([
+      fetchWithRetry('/api/me', { headers: { Authorization: 'Bearer ' + token } }),
+      fetchWithRetry('/api/store/packages')
+    ]);
+    if (!meRes.ok) {
+      userBox.textContent = 'ورودت منقضی شده — وقتی رو «خرید» بزنی شناسه‌ت رو ازت می‌پرسه.';
+      const data = await pkgRes.json().catch(()=>({packages:[]}));
+      renderPackages(data.packages || []);
+      return;
+    }
     const me = await meRes.json();
-    userBox.innerHTML = `خوش اومدی <b>${escapeHtml(me.user.username)}</b> — موجودی فعلی: 🪙 ${me.user.coins} — 💎 ${me.user.gems || 0}`;
-  } catch (e) {
-    userBox.textContent = 'اتصال به سرور برقرار نشد.';
-    return;
-  }
+    userBox.innerHTML = خوش اومدی <b>${escapeHtml(me.user.username)}</b> — موجودی فعلی: 🪙 ${me.user.coins} — 💎 ${me.user.gems || 0};
 
-  try {
-    const pkgRes = await fetch('/api/store/packages');
     const data = await pkgRes.json();
     if (data.sandbox) {
       document.getElementById('sandboxNote').innerHTML =
@@ -61,30 +80,73 @@ async function init(){
     }
     renderPackages(data.packages || []);
   } catch (e) {
-    status.textContent = 'لیست بسته‌ها لود نشد.';
+    userBox.textContent = 'اتصال به سرور برقرار نشد — یه بار دیگه صفحه رو رفرش کن.';
+  }
+}async function loadPackages(){
+  try {
+    const r = await fetchWithRetry('/api/store/packages');
+    const data = await r.json();
+    if (data.sandbox) {
+      document.getElementById('sandboxNote').innerHTML =
+        '<div class="sandbox-note">⚠️ فروشگاه در حالت آزمایشی (sandbox) است — هیچ پول واقعی کم نمی‌شود.</div>';
+    }
+    renderPackages(data.packages || []);
+  } catch (e) {
+    document.getElementById('status').textContent = 'لیست بسته‌ها لود نشد';
   }
 }
 
 function renderPackages(packages){
   const box = document.getElementById('packages');
-  box.innerHTML = packages.map(p => `
+  box.innerHTML = packages.map(p => 
     <div class="card">
       <div class="info"><b>${p.type === 'gems' ? '💎' : '🪙'} ${escapeHtml(p.label)}</b><div>${p.priceToman.toLocaleString('fa-IR')} تومان</div></div>
       <button class="buy-btn" onclick="buy('${p.id}', this)">خرید</button>
     </div>
-  `).join('') || '<div style="text-align:center;color:#999">بسته‌ای برای فروش تعریف نشده.</div>';
+  ).join('') || '<div style="text-align:center;color:#999">بسته‌ای برای فروش تعریف نشده.</div>';
 }
 
 async function buy(packageId, btn){
   const status = document.getElementById('status');
   status.style.color = '#c9b8ee';
-  status.textContent = 'در حال اتصال به درگاه پرداخت...';
   btn.disabled = true;
+
   try {
-    const res = await fetch('/api/store/purchase-init', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-      body: JSON.stringify({ packageId })
+    if (token) {
+      // Came from inside the game with a token — identity already known, buy directly.
+      status.textContent = 'در حال اتصال به درگاه پرداخت...';
+      const res = await fetchWithRetry('/api/store/purchase-init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+        body: JSON.stringify({ packageId })
+      });
+      const data = await res.json();
+      if (!res.ok) { status.style.color = '#ff9ab4'; status.textContent = data.error || 'خطا در ساخت پرداخت'; btn.disabled = false; return; }
+      location.href = data.paymentUrl;
+      return;
+    }
+
+    // No token — ask which account to credit only now, at the moment of buying.
+    const raw = prompt('شناسه‌ی بازی‌ت رو وارد کن (مثلاً id.dfhtgyrt):');
+    if (!raw || !raw.trim()) { btn.disabled = false; return; }
+
+    status.textContent = 'در حال پیدا کردن حساب...';
+    const lookupRes = await fetchWithRetry('/api/store/lookup-id', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customId: raw.trim() })
+    });
+    const lookupData = await lookupRes.json();
+    if (!lookupRes.ok) { status.style.color = '#ff9ab4'; status.textContent = lookupData.error || 'شناسه پیدا نشد'; btn.disabled = false; return; }
+
+    const proceed = confirm(این خرید برای حساب «${lookupData.username}» ثبت می‌شه. ادامه بدم؟);
+    if (!proceed) { status.textContent = ''; btn.disabled = false; return; }
+
+    status.textContent = 'در حال اتصال به درگاه پرداخت...';
+    // Re-sent fresh here — the server verifies this id again from scratch right now,
+    // never relying on the lookup that just happened a moment ago.
+    const res = await fetchWithRetry('/api/store/purchase-init-by-id', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customId: raw.trim(), packageId })
     });
     const data = await res.json();
     if (!res.ok) { status.style.color = '#ff9ab4'; status.textContent = data.error || 'خطا در ساخت پرداخت'; btn.disabled = false; return; }
