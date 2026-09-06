@@ -40,6 +40,7 @@ function fromRow(row) {
     role: row.role,
     banned: row.banned,
     banUntil: row.ban_until || null,
+    isStar: !!row.is_star,
     createdAt: row.created_at,
   };
 }
@@ -104,6 +105,7 @@ async function updateUser(id, patch) {
   if ('banUntil' in patch) row.ban_until = patch.banUntil;
   if ('customId' in patch) row.custom_id = patch.customId;
   if ('role' in patch) row.role = patch.role;
+  if ('isStar' in patch) row.is_star = patch.isStar;
   const { data, error } = await getClient().from('users').update(row).eq('id', id).select().single();
   if (error) throw error;
   return fromRow(data);
@@ -149,9 +151,23 @@ async function setVersionConfig({ minVersion, updateUrl, updateMessage }) {
   return { minVersion: minVersion || '0.0.0', updateUrl: updateUrl || '', updateMessage: updateMessage || '' };
 }
 
+// ===== Admin broadcast — same app_settings row, different columns again =====
+async function getBroadcast() {
+  const { data, error } = await getClient().from('app_settings').select('*').eq('id', 1).maybeSingle();
+  if (error) throw error;
+  if (!data) return { text: '', sentAt: null };
+  return { text: data.broadcast_text || '', sentAt: data.broadcast_at || null };
+}
+async function setBroadcast({ text }) {
+  const sentAt = new Date().toISOString();
+  const { error } = await getClient().from('app_settings').upsert({ id: 1, broadcast_text: text, broadcast_at: sentAt });
+  if (error) throw error;
+  return { text, sentAt };
+}
+
 async function deleteUser(id) {
   const { error } = await getClient().from('users').delete().eq('id', id);
   if (error) throw error;
 }
 
-module.exports = { findByUsername, findById, createUser, updateUser, deleteUser, listAll, getMaintenance, setMaintenance, getVersionConfig, setVersionConfig };
+module.exports = { findByUsername, findById, createUser, updateUser, deleteUser, listAll, getMaintenance, setMaintenance, getVersionConfig, setVersionConfig, getBroadcast, setBroadcast };
