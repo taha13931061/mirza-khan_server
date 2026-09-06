@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>فروشگاه میرزاخان</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Tahoma,Arial,sans-serif;background:linear-gradient(160deg,#0c0818,#160b2e 45%,#0a1230);color:#fff;min-height:100vh;padding:20px 14px 40px}
+  h1{text-align:center;font-size:20px;margin:10px 0 4px}
+  .sub{text-align:center;color:#b9a4e8;font-size:13px;margin-bottom:20px}
+  .card{max-width:420px;margin:0 auto 14px;background:linear-gradient(160deg,rgba(30,18,55,.85),rgba(8,10,26,.85));
+    border:1px solid rgba(130,90,220,.35);border-radius:16px;padding:16px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .card .info b{font-size:15px}
+  .card .info div{color:#c9b8ee;font-size:12.5px;margin-top:4px}
+  .buy-btn{background:linear-gradient(160deg,#7b4fe0,#4a2fb0);border:none;border-radius:10px;padding:10px 18px;
+    color:#fff;font-weight:800;font-size:13px;cursor:pointer;white-space:nowrap}
+  .buy-btn:disabled{opacity:.5;cursor:default}
+  #status{max-width:420px;margin:0 auto 16px;text-align:center;font-size:13px;color:#ff9ab4}
+  #userBox{max-width:420px;margin:0 auto 16px;text-align:center;font-size:13px;color:#eee0ff}
+  .sandbox-note{max-width:420px;margin:0 auto 20px;text-align:center;background:rgba(255,193,7,.12);
+    border:1px solid rgba(255,193,7,.4);border-radius:12px;padding:10px 14px;font-size:12px;color:#ffe08a}
+</style>
+</head>
+<body>
+  <h1>🛒 فروشگاه میرزاخان</h1>
+  <div class="sub">خرید سکه و جم واقعی</div>
+  <div id="userBox">در حال بررسی حساب...</div>
+  <div id="sandboxNote"></div>
+  <div id="status"></div>
+  <div id="packages"></div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const token = params.get('token') || localStorage.getItem('mk_shop_token') || '';
+if (token) localStorage.setItem('mk_shop_token', token);
+
+async function init(){
+  const userBox = document.getElementById('userBox');
+  const status = document.getElementById('status');
+  if (!token) {
+    userBox.textContent = 'برای خرید باید از داخل بازی وارد فروشگاه بشی.';
+    return;
+  }
+  try {
+    const meRes = await fetch('/api/me', { headers: { Authorization: 'Bearer ' + token } });
+    if (!meRes.ok) { userBox.textContent = 'ورودت منقضی شده — از داخل بازی دوباره وارد فروشگاه شو.'; return; }
+    const me = await meRes.json();
+    userBox.innerHTML = `خوش اومدی <b>${escapeHtml(me.user.username)}</b> — موجودی فعلی: 🪙 ${me.user.coins} — 💎 ${me.user.gems || 0}`;
+  } catch (e) {
+    userBox.textContent = 'اتصال به سرور برقرار نشد.';
+    return;
+  }
+
+  try {
+    const pkgRes = await fetch('/api/store/packages');
+    const data = await pkgRes.json();
+    if (data.sandbox) {
+      document.getElementById('sandboxNote').innerHTML =
+        '<div class="sandbox-note">⚠️ فروشگاه در حالت آزمایشی (sandbox) است — هیچ پول واقعی کم نمی‌شود.</div>';
+    }
+    renderPackages(data.packages || []);
+  } catch (e) {
+    status.textContent = 'لیست بسته‌ها لود نشد.';
+  }
+}
+
+function renderPackages(packages){
+  const box = document.getElementById('packages');
+  box.innerHTML = packages.map(p => `
+    <div class="card">
+      <div class="info"><b>${p.type === 'gems' ? '💎' : '🪙'} ${escapeHtml(p.label)}</b><div>${p.priceToman.toLocaleString('fa-IR')} تومان</div></div>
+      <button class="buy-btn" onclick="buy('${p.id}', this)">خرید</button>
+    </div>
+  `).join('') || '<div style="text-align:center;color:#999">بسته‌ای برای فروش تعریف نشده.</div>';
+}
+
+async function buy(packageId, btn){
+  const status = document.getElementById('status');
+  status.style.color = '#c9b8ee';
+  status.textContent = 'در حال اتصال به درگاه پرداخت...';
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/store/purchase-init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({ packageId })
+    });
+    const data = await res.json();
+    if (!res.ok) { status.style.color = '#ff9ab4'; status.textContent = data.error || 'خطا در ساخت پرداخت'; btn.disabled = false; return; }
+    location.href = data.paymentUrl;
+  } catch (e) {
+    status.style.color = '#ff9ab4'; status.textContent = 'اتصال به سرور برقرار نشد';
+    btn.disabled = false;
+  }
+}
+
+function escapeHtml(s){ return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+init();
+</script>
+</body>
+</html>
