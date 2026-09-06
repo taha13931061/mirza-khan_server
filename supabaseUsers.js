@@ -51,10 +51,21 @@ async function findByUsername(username) {
   return await autoExpireBan(fromRow(data));
 }
 
+// Public-identifier lookup — used by the shop's "enter your id.xxxxxxxx" flow, which has
+// no password/JWT at all. This can only ever be used to find WHICH account to credit
+// currency to; it's never wired to anything that exposes private data or lets the caller
+// take an action as that account.
+async function findByCustomId(customId) {
+  const { data, error } = await getClient().from('users').select('*').eq('custom_id', String(customId || '').toLowerCase()).maybeSingle();
+  if (error) throw error;
+  return await autoExpireBan(fromRow(data));
+}
+
 async function findById(id) {
   const { data, error } = await getClient().from('users').select('*').eq('id', id).maybeSingle();
   if (error) throw error;
-  const user = fromRow(data);
+  let user = fromRow(data);
+  user = await ensureCustomId(user);
   return await autoExpireBan(user);
 }
 
@@ -66,14 +77,35 @@ async function autoExpireBan(user) {
   return user;
 }
 
+// Accounts created before the friendly custom_id system existed have none — backfill one
+// on first read instead of leaving different screens to fall back to the raw internal id
+// in different, inconsistent ways (that's what looked like "two different IDs" for the
+// same account).
+async function ensureCustomId(user) {
+  if (user && !user.customId) {
+    const customId = await generateUniqueCustomId();
+    return await updateUser(user.id, { customId });
+  }
+  return user;
+}
+
 async function generateUniqueCustomId() {
-  // 7-digit friendly ID like a Telegram/Discord numeric ID — not the small sequential DB id.
+  // Friendly ID like "id.dfhtgyrt" — 8 lowercase letters after the "id." prefix.
+  // The stored value includes no prefix (just the 8-letter code); "id." is added
+  // wherever it's displayed, so every screen shows it the exact same way.
+  const letters = 'abcdefghijklmnopqrstuvwxyz';
   for (let i = 0; i < 10; i++) {
-    const candidate = String(Math.floor(1000000 + Math.random() * 9000000));
+    let candidate = '';
+    for (let j = 0; j < 8; j++) candidate += letters[Math.floor(Math.random() * letters.length)];
     const { data } = await getClient().from('users').select('id').eq('custom_id', candidate).maybeSingle();
     if (!data) return candidate;
   }
-  return String(Date.now()).slice(-7); // extremely unlikely fallback
+  return 'u' + String(Date.now()).slice(-7); // extremely unlikely fallback
+}
+
+async function isCustomIdTaken(customId, excludingUserId) {
+  const { data } = await getClient().from('users').select('id').eq('custom_id', customId).maybeSingle();
+  return !!(data && data.id !== excludingUserId);
 }
 
 async function createUser({ username, passwordHash }) {
@@ -170,4 +202,4 @@ async function deleteUser(id) {
   if (error) throw error;
 }
 
-module.exports = { findByUsername, findById, createUser, updateUser, deleteUser, listAll, getMaintenance, setMaintenance, getVersionConfig, setVersionConfig, getBroadcast, setBroadcast };
+module.exports = { findByUsername, findByCustomId, findById, createUser, updateUser, deleteUser, listAll, getMaintenance, setMaintenance, getVersionConfig, setVersionConfig, getBroadcast, setBroadcast, isCustomIdTaken };

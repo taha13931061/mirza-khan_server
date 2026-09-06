@@ -10,27 +10,14 @@
 // and issues a real pin, "sandbox" is a real, documented test value — it exercises the
 // exact same endpoints with no real money moving, so this code needs zero changes later,
 // just swap the env var.
+//
+// Package definitions themselves live in storePackages.js (Supabase-backed) now, so the
+// admin panel can add/remove them without a redeploy — this file only talks to the gateway.
 
 const AQAYEPARDAKHT_PIN = process.env.AQAYEPARDAKHT_PIN || 'sandbox';
 const CREATE_URL = 'https://panel.aqayepardakht.ir/api/v2/create';
 const VERIFY_URL = 'https://panel.aqayepardakht.ir/api/v2/verify';
 const STARTPAY_BASE = 'https://panel.aqayepardakht.ir/startpay/';
-
-// EXAMPLE prices — these are placeholders, not a real pricing decision. Edit freely;
-// nothing else in the code needs to change when you do.
-const PACKAGES = {
-  coins_100: { type: 'coins', amount: 100, priceToman: 15000, label: '۱۰۰ سکه' },
-  coins_550: { type: 'coins', amount: 550, priceToman: 65000, label: '۵۵۰ سکه (۵۰۰ + ۵۰ هدیه)' },
-  gems_20: { type: 'gems', amount: 20, priceToman: 25000, label: '۲۰ جم' },
-  gems_110: { type: 'gems', amount: 110, priceToman: 110000, label: '۱۱۰ جم (۱۰۰ + ۱۰ هدیه)' },
-};
-
-function listPackages() {
-  return Object.entries(PACKAGES).map(([id, p]) => ({ id, label: p.label, priceToman: p.priceToman, type: p.type, amount: p.amount }));
-}
-function getPackage(id) {
-  return PACKAGES[id] || null;
-}
 
 async function gatewayCreate({ amountToman, callbackUrl, invoiceId, description }) {
   const res = await fetch(CREATE_URL, {
@@ -58,4 +45,4 @@ async function gatewayVerify({ amountToman, transId }) {
   return { ok: Number(data.code) === 1, raw: data };
 }
 
-module.exports = { listPackages, getPackage, gatewayCreate, gatewayVerify, AQAYEPARDAKHT_PIN };
+module.exports = { gatewayCreate, gatewayVerify, AQAYEPARDAKHT_PIN };

@@ -148,11 +148,106 @@ create index if not exists battle_history_player_idx on battle_history(player_id
 alter table app_settings add column if not exists min_version text;
 alter table app_settings add column if not exists update_url text;
 alter table app_settings add column if not exists update_message text;
+alter table app_settings add column if not exists broadcast_text text;
+alter table app_settings add column if not exists broadcast_at timestamptz;
 ```
 
-این سه ستون به همون جدول `app_settings` (که برای حالت خاموشی/تعمیرات استفاده می‌شد) اضافه
-می‌شن و پایه‌ی سیستم «بروزرسانی اجباری» هستن — از پنل مدیریت، بخش «🔄 نسخه اپ»، حداقل
-نسخه‌ی مجاز و لینک مایکت رو تنظیم کن.
+این ستون‌ها به همون جدول `app_settings` (که برای حالت خاموشی/تعمیرات استفاده می‌شد) اضافه
+می‌شن. سه‌تای اول پایه‌ی سیستم «بروزرسانی اجباری» هستن، دوتای آخر برای «پیام همگانی» —
+از پنل مدیریت، بخش‌های «🔄 نسخه اپ» و «📢 پیام همگانی» ازشون استفاده می‌کنن.
+
+```sql
+create table if not exists purchases (
+  id bigserial primary key,
+  user_id integer not null,
+  package_id text not null,
+  amount_toman integer not null,
+  reward_type text not null, -- 'coins' | 'gems'
+  reward_amount integer not null,
+  status text not null default 'pending', -- pending | paid | failed
+  gateway_transid text,
+  created_at timestamptz default now(),
+  paid_at timestamptz
+);
+create index if not exists purchases_transid_idx on purchases(gateway_transid);
+create index if not exists purchases_user_idx on purchases(user_id);
+```
+
+## فروشگاه واقعی (خرید سکه/جم با پول واقعی)
+
+این جدول (`purchases`) پایه‌ی «فروشگاه رسمی بازی» هست — همون جایی که کاربر با کارت بانکی
+واقعاً سکه/جم می‌خره، از داخل بازی (دکمه‌ی «🛒 ورود به فروشگاه» تو تب «خرید جم» فروشگاه).
+
+**تنظیم درگاه:** یه متغیر محیطی رو Render اضافه کن:
+- `AQAYEPARDAKHT_PIN` → پین درگاه آقای پرداخت. تا وقتی پین واقعی نگرفتی، این رو خالی
+  بذار یا مقدار `sandbox` بهش بده — همون endpoint های واقعی رو صدا می‌زنه ولی بدون پول
+  واقعی، دقیقاً برای همین مرحله‌ی تایید سایت که آقای پرداخت ازت خواسته ساخته شده.
+
+**آدرس فروشگاه:** همین که این آپدیت رو دیپلوی کنی، فروشگاه خودکار در دسترس می‌شه، بدون
+هیچ تنظیم اضافه‌ای:
+`https://<آدرس-سرور-تو-Render>/shop/`
+
+اگه دامنه‌ی جدیدت (همونی که رو آروان‌کلود داری) رو هم بخوای همینو نشون بده، کافیه تو
+پنل Render، تو تنظیمات همین سرویس، بخش **Custom Domains** رو باز کنی، دامنه‌ت رو اضافه
+کنی، و رکورد DNS ای (معمولاً یه CNAME) که Render نشونت می‌ده رو تو پنل DNS آروان‌کلود
+اضافه کنی. بعد از چند دقیقه (تا انتشار DNS)، همون فروشگاه رو دامنه‌ی خودت هم بالا میاد —
+بدون اینکه کد عوض بشه.
+
+**بسته‌های فروش:** قیمت‌ها و مقدار سکه/جم هر بسته تو فایل `store.js`، آبجکت `PACKAGES`
+تعریف شده — همون‌جا (اسم، قیمت به تومان، مقدار سکه/جم) رو ویرایش کن، بدون نیاز به تغییر
+جای دیگه‌ی کد.
+
+**مهم برای وقتی پین واقعی گرفتی:** فقط مقدار `AQAYEPARDAKHT_PIN` رو رو Render عوض کن
+به پین واقعی — هیچ کد دیگه‌ای نیاز به تغییر نداره.
+
+## نسخه‌ی استار
+
+```sql
+alter table users add column if not exists is_star boolean not null default false;
+```
+
+این یه ستون سادست رو جدول `users` — از پنل مدیریت، کنار هر بازیکن دکمه‌ی «⭐ استار کن»
+هست که این فلگ رو روشن/خاموش می‌کنه. حساب‌های استار: راهنما براشون رایگانه، به همه‌ی
+مراحل بدون ترتیب دسترسی دارن، و تو کل اپ (منو، پروفایل، لیدربورد، پنل مدیریت) یه ⭐ کنار
+اسمشون و تم طلایی می‌بینن. تشخیص «استار بودن» کاملاً سمت سرور و بر اساس **حساب**
+هست — نه بر اساس اینکه از کدوم نسخه‌ی APK (عادی یا استار) وصل شدی. یعنی همین یک فایل
+`index.html` برای هر دو نسخه کافیه؛ اسم/آیکون دو تا APK از هم فرق می‌کنه، ولی کدشون یکیه.
+
+**نکته‌ی صادقانه:** یکی از خواسته‌های اولیه «جان نامحدود» بود — ولی الان تو کل بازی
+هیچ مکانیزم واقعی‌ای برای کم شدن جان با جواب غلط وجود نداره (جان فقط تزئینیه و از
+فروشگاه خریداری می‌شه)، پس این مورد رو پیاده نکردم چون چیزی برای «نامحدود کردنش» نبود.
+اگه بخوای، اول باید یه سیستم واقعی جان اضافه کنیم، بعد استارها ازش معاف بشن.
+
+## مدیریت فروشگاه از پنل (بسته‌ها + سفارش‌ها)
+
+```sql
+create table if not exists store_packages (
+  id text primary key,
+  label text not null,
+  price_toman integer not null,
+  reward_type text not null, -- 'coins' | 'gems'
+  reward_amount integer not null,
+  active boolean not null default true,
+  created_at timestamptz default now()
+);
+
+-- بسته‌های اولیه (همونایی که قبلاً تو کد بودن) — می‌تونی بعداً از پنل مدیریت
+-- ویرایش/حذفشون کنی یا بسته‌ی جدید اضافه کنی، بدون نیاز به SQL دوباره.
+insert into store_packages (id, label, price_toman, reward_type, reward_amount) values
+  ('coins_100', '۱۰۰ سکه', 15000, 'coins', 100),
+  ('coins_550', '۵۵۰ سکه (۵۰۰ + ۵۰ هدیه)', 65000, 'coins', 550),
+  ('gems_20', '۲۰ جم', 25000, 'gems', 20),
+  ('gems_110', '۱۱۰ جم (۱۰۰ + ۱۰ هدیه)', 110000, 'gems', 110)
+on conflict (id) do nothing;
+```
+
+این جدول جایگزین لیست ثابتی شد که قبلاً تو `store.js` نوشته شده بود — از پنل مدیریت،
+بخش «🛒 مدیریت فروشگاه» (فقط برای owner/creator، چون داده‌ی مالیه)، دو تا تب داره:
+- **سفارش‌ها:** همه‌ی خریدها (در انتظار/انجام‌شده/ناموفق) با اسم خریدار و مبلغ
+- **بسته‌ها:** لیست بسته‌های فعلی + فرم اضافه کردن بسته‌ی جدید + دکمه‌ی غیرفعال/حذف کردن
+
+بدون این جدول، فروشگاه (هم `/shop/` هم بخش مدیریتش) خطای «جدول store_packages رو تو
+Supabase ساختی؟» می‌ده.
 
 این جدول‌های جدید باعث می‌شن چت (همگانی، گروهی، خصوصی) و گزارش‌ها واقعاً رو سرور ذخیره بشن —
 قبلاً رو یه فایل محلی بودن که هر بار سرور ری‌استارت/آپدیت می‌شد، پاک می‌شدن.

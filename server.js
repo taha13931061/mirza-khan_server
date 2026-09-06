@@ -17,7 +17,8 @@ const progression = require('./progression');
 const profanity = require('./profanityFilter'); // filters cursing in chat text, group names, usernames
 const friends = require('./friends');           // real friends system (Supabase — replaces the old localStorage-only list)
 const battles = require('./battles');            // persistent battle history + wins leaderboard
-const store = require('./store');                 // Aqaye Pardakht gateway integration + package list
+const store = require('./store');                 // Aqaye Pardakht gateway integration
+const storePackages = require('./storePackages'); // package definitions (Supabase — admin-editable)
 const purchases = require('./purchases');         // persistent order tracking for real-money purchases
 let customStages = []; // loaded from Supabase at boot — lets the owner add stages without a redeploy
 async function reloadCustomStages() { try { customStages = await chat.listCustomStages(); } catch (e) { console.error('custom stages load failed', e.message); } }
@@ -330,33 +331,78 @@ app.post('/api/admin/broadcast', adminRequired, async (req, res) => {
 });
 
 // ================= REAL-MONEY STORE (Aqaye Pardakht) =================
-app.get('/api/store/packages', (req, res) => {
-  res.json({ packages: store.listPackages(), sandbox: store.AQAYEPARDAKHT_PIN === 'sandbox' });
+app.get('/api/store/packages', async (req, res) => {
+  try {
+    const packages = await storePackages.listAll(true);
+    res.json({ packages, sandbox: store.AQAYEPARDAKHT_PIN === 'sandbox' });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول store_packages رو تو Supabase ساختی؟' }); }
 });
+
+// Shared by both entry points: the in-game (JWT-authenticated) flow and the "type in your
+// id.xxxxxxxx" flow reachable straight from a browser with no token at all. Both end up
+// here once the target account is known — this is the one place that actually talks to
+// the gateway, so there's only one implementation to keep correct.
+async function initPurchaseForUser(targetUserId, pkgId, req) {
+  const pkg = await storePackages.get(pkgId);
+  if (!pkg || !pkg.active) throw Object.assign(new Error('بسته‌ی نامعتبر'), { status: 400 });
+
+  const purchase = await purchases.createPending({
+    userId: targetUserId, packageId: pkgId, priceToman: pkg.priceToman,
+    rewardType: pkg.type, rewardAmount: pkg.amount
+  });
+
+  const base = `${req.protocol}://${req.get('host')}`;
+  const callbackUrl = `${base}/api/store/verify`;
+  const { transId, paymentUrl } = await store.gatewayCreate({
+    amountToman: pkg.priceToman, callbackUrl, invoiceId: purchase.id,
+    description: `${pkg.label} — میرزاخان`
+  });
+  await purchases.attachTransId(purchase.id, transId);
+  return paymentUrl;
+}
 
 app.post('/api/store/purchase-init', authRequired, async (req, res) => {
   try {
     const pkgId = String((req.body && req.body.packageId) || '');
-    const pkg = store.getPackage(pkgId);
-    if (!pkg) return res.status(400).json({ error: 'بسته‌ی نامعتبر' });
-
-    const purchase = await purchases.createPending({
-      userId: req.user.id, packageId: pkgId, priceToman: pkg.priceToman,
-      rewardType: pkg.type, rewardAmount: pkg.amount
-    });
-
-    // Callback base is derived from the incoming request's own host, so this works
-    // whether the shop is opened at the Render URL or at a custom domain pointed at it —
-    // no env var to keep in sync with wherever the domain ends up.
-    const base = `${req.protocol}://${req.get('host')}`;
-    const callbackUrl = `${base}/api/store/verify`;
-    const { transId, paymentUrl } = await store.gatewayCreate({
-      amountToman: pkg.priceToman, callbackUrl, invoiceId: purchase.id,
-      description: `${pkg.label} — میرزاخان`
-    });
-    await purchases.attachTransId(purchase.id, transId);
+    const paymentUrl = await initPurchaseForUser(req.user.id, pkgId, req);
     res.json({ paymentUrl });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور در اتصال به درگاه — جدول purchases رو تو Supabase ساختی؟' }); }
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'خطای سرور در اتصال به درگاه — جدول purchases رو تو Supabase ساختی؟' });
+  }
+});
+
+// Entry point for someone who reaches the shop with no token at all (e.g. found it via a
+// search engine, or typed the URL directly) — they identify the account to credit by its
+// public id.xxxxxxxx only. No password is involved, so this can only ever top up that
+// account's coins/gems; it never returns a session and never exposes anything private.
+app.post('/api/store/lookup-id', async (req, res) => {
+  try {
+    const customId = String((req.body && req.body.customId) || '').trim().toLowerCase().replace(/^id\./, '');
+    if (!customId) return res.status(400).json({ error: 'شناسه رو بنویس' });
+    const target = await users.findByCustomId(customId);
+    if (!target) return res.status(404).json({ error: 'شناسه‌ای با این مشخصات پیدا نشد' });
+    if (target.banned) return res.status(403).json({ error: 'این حساب مسدود است' });
+    res.json({ username: target.username, coins: target.coins, gems: target.gems || 0 });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+app.post('/api/store/purchase-init-by-id', async (req, res) => {
+  try {
+    const customId = String((req.body && req.body.customId) || '').trim().toLowerCase().replace(/^id\./, '');
+    const pkgId = String((req.body && req.body.packageId) || '');
+    if (!customId) return res.status(400).json({ error: 'شناسه رو بنویس' });
+    // Re-verified here, at the moment of buying, exactly as requested — never trusts a
+    // lookup the browser did earlier, always checks the ID fresh against the DB right now.
+    const target = await users.findByCustomId(customId);
+    if (!target) return res.status(404).json({ error: 'شناسه‌ای با این مشخصات پیدا نشد' });
+    if (target.banned) return res.status(403).json({ error: 'این حساب مسدود است' });
+    const paymentUrl = await initPurchaseForUser(target.id, pkgId, req);
+    res.json({ paymentUrl });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    console.error(e); res.status(500).json({ error: 'خطای سرور در اتصال به درگاه — جدول purchases رو تو Supabase ساختی؟' });
+  }
 });
 
 // Called directly by the gateway's own server after payment — never by the user's
@@ -393,6 +439,67 @@ app.get('/api/store/verify', async (req, res) => {
     console.error(e);
     return resultPage('error', 'خطای سرور');
   }
+});
+
+// ================= ADMIN: STORE MANAGEMENT (orders + packages) =================
+// Owner-only — this is real-money data (order amounts, payment status), not general
+// admin/moderator territory.
+app.get('/api/admin/store/orders', ownerRequired, async (req, res) => {
+  try {
+    const orders = await purchases.listAll(300);
+    const withNames = await Promise.all(orders.map(async o => {
+      const u = await users.findById(o.user_id).catch(() => null);
+      return {
+        id: o.id, username: u ? u.username : `#${o.user_id}`, packageId: o.package_id,
+        amountToman: o.amount_toman, rewardType: o.reward_type, rewardAmount: o.reward_amount,
+        status: o.status, createdAt: o.created_at, paidAt: o.paid_at
+      };
+    }));
+    res.json({ orders: withNames });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول purchases رو تو Supabase ساختی؟' }); }
+});
+
+app.get('/api/admin/store/packages', ownerRequired, async (req, res) => {
+  try {
+    const packages = await storePackages.listAll(false); // include inactive ones too, for management
+    res.json({ packages });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول store_packages رو تو Supabase ساختی؟' }); }
+});
+
+app.post('/api/admin/store/packages', ownerRequired, async (req, res) => {
+  try {
+    const id = String((req.body && req.body.id) || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+    const label = String((req.body && req.body.label) || '').trim().slice(0, 60);
+    const priceToman = parseInt(req.body && req.body.priceToman);
+    const type = (req.body && req.body.type) === 'gems' ? 'gems' : 'coins';
+    const amount = parseInt(req.body && req.body.amount);
+    if (!id || !label || !priceToman || priceToman < 1 || !amount || amount < 1) {
+      return res.status(400).json({ error: 'همه‌ی فیلدها رو درست پر کن (شناسه، اسم، قیمت، مقدار)' });
+    }
+    const existing = await storePackages.get(id);
+    if (existing) return res.status(400).json({ error: 'بسته‌ای با این شناسه از قبل هست' });
+    const pkg = await storePackages.create({ id, label, priceToman, type, amount });
+    logAudit(req.user.username, 'STORE_PACKAGE_CREATE', `${id} — ${label} — ${priceToman} تومان`);
+    res.json({ package: pkg });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور — جدول store_packages رو تو Supabase ساختی؟' }); }
+});
+
+app.post('/api/admin/store/packages/:id/toggle', ownerRequired, async (req, res) => {
+  try {
+    const pkg = await storePackages.get(req.params.id);
+    if (!pkg) return res.status(404).json({ error: 'بسته پیدا نشد' });
+    await storePackages.setActive(pkg.id, !pkg.active);
+    logAudit(req.user.username, 'STORE_PACKAGE_TOGGLE', `${pkg.id} -> active=${!pkg.active}`);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+app.delete('/api/admin/store/packages/:id', ownerRequired, async (req, res) => {
+  try {
+    await storePackages.remove(req.params.id);
+    logAudit(req.user.username, 'STORE_PACKAGE_DELETE', req.params.id);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
 app.get('/api/stages', (req, res) => {
@@ -517,6 +624,21 @@ app.get('/api/leaderboard', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
+// Who's online right now — shown in the online-battle screen so a player can see there
+// are real people to match against before they hit "find opponent". Reads straight from
+// the in-memory presence map (already updated by chat:auth / disconnect), so this never
+// touches Supabase and is always instant.
+app.get('/api/online-users', authRequired, (req, res) => {
+  const list = [];
+  for (const [userId, info] of presence.entries()) {
+    if (userId === req.user.id) continue;
+    if (!info.username) continue;
+    list.push({ username: info.username, status: info.status });
+  }
+  list.sort((a, b) => (a.status === 'playing') - (b.status === 'playing'));
+  res.json({ online: list.slice(0, 50), total: list.length });
+});
+
 // Admin access is now a real role on a real account (owner / moderator),
 // checked server-side from the JWT — not a separate hardcoded password.
 // To make someone an owner, run this once in Supabase SQL Editor:
@@ -582,6 +704,32 @@ app.get('/api/inspector/ban-reports', inspectorRequired, async (req, res) => {
       type: u.banUntil ? 'موقت' : 'دائمی'
     }));
     res.json({ bans: banned });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+// Read-only for inspectors — they can see and flag, but renaming/deleting a group stays
+// a moderator action (adminRequired, via /api/admin/groups).
+app.get('/api/inspector/groups', inspectorRequired, async (req, res) => {
+  try {
+    const groups = await chat.listAllGroups(200);
+    const flagged = groups.map(g => ({ ...g, flagged: profanity.containsProfanity(g.name) }));
+    res.json({ groups: flagged });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
+// Repeat-offender view: tallies open (unresolved) reports per reported user, so an
+// inspector can spot who keeps getting reported without manually cross-referencing.
+app.get('/api/inspector/report-counts', inspectorRequired, async (req, res) => {
+  try {
+    const reports = (await chat.listReports()).filter(r => r.status !== 'resolved');
+    const counts = {};
+    for (const r of reports) {
+      const key = r.reportedUsername;
+      if (!key) continue;
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    const sorted = Object.entries(counts).map(([username, count]) => ({ username, count })).sort((a, b) => b.count - a.count);
+    res.json({ counts: sorted });
   } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
 });
 
@@ -662,6 +810,24 @@ app.post('/api/admin/players/:id/coins', adminRequired, async (req, res) => {
 // One flag on the account, checked server-side wherever a perk matters (hearts, hints,
 // stage unlock) — never trusted from the client. Whoever built the APK (normal-branded
 // or Star-branded) doesn't matter; what the ACCOUNT is flagged as does.
+// Self-service only — an owner/creator can restyle their OWN id, never anyone else's.
+// Kept separate from the admin player-management routes on purpose: those operate on any
+// player by :id, this one always operates on req.user.id no matter what's in the body.
+app.post('/api/admin/my-id', ownerRequired, async (req, res) => {
+  try {
+    let customId = String((req.body && req.body.customId) || '').trim().toLowerCase();
+    if (!/^[a-z0-9]{3,20}$/.test(customId)) {
+      return res.status(400).json({ error: 'شناسه باید بین ۳ تا ۲۰ حرف/عدد انگلیسی کوچیک باشه (بدون فاصله یا نماد)' });
+    }
+    if (profanity.containsProfanity(customId)) return res.status(400).json({ error: 'این شناسه مجاز نیست' });
+    const taken = await users.isCustomIdTaken(customId, req.user.id);
+    if (taken) return res.status(400).json({ error: 'این شناسه قبلاً گرفته شده' });
+    const updated = await users.updateUser(req.user.id, { customId });
+    logAudit(req.user.username, 'CUSTOM_ID_SET', `-> id.${customId}`);
+    res.json({ user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
 app.post('/api/admin/players/:id/star', adminRequired, async (req, res) => {
   try {
     const target = await users.findById(parseInt(req.params.id));
@@ -787,7 +953,10 @@ function mkRegisterProfanityStrike(userId) {
 }
 const presence = new Map(); // userId -> { status: 'online'|'playing', socketId }
 const userSockets = new Map(); // userId -> Set<socket> — for direct group/DM delivery
-function setPresence(userId, status) { presence.set(userId, { status, at: Date.now() }); }
+function setPresence(userId, status, username) {
+  const existing = presence.get(userId);
+  presence.set(userId, { status, at: Date.now(), username: username || existing?.username });
+}
 io.on('connection', (socket) => {
   socket.on('chat:auth', async (token) => {
     try {
@@ -799,7 +968,7 @@ io.on('connection', (socket) => {
       if (dbUser.banned) return socket.emit('chat:error', 'حساب شما مسدود شده است');
       socket.data.user = { id: dbUser.id, username: dbUser.username, role: dbUser.role };
       socket.emit('chat:authed', { username: socket.data.user.username });
-      setPresence(socket.data.user.id, 'online');
+      setPresence(socket.data.user.id, 'online', socket.data.user.username);
       if (!userSockets.has(socket.data.user.id)) userSockets.set(socket.data.user.id, new Set());
       userSockets.get(socket.data.user.id).add(socket);
     }
@@ -1016,6 +1185,30 @@ async function finishBattle(battleId, winnerId) {
 }
 
 // ================= TESTER TOOLS (real, tied to the account's own role) =================
+// Testers are trusted with answers for QA purposes only (never exposed to normal
+// players) — lets "auto-solve" actually exercise the real completion flow instead of
+// hitting a "/api/tester/auto" endpoint that never existed.
+app.get('/api/tester/stage/:id/solution', testerRequired, async (req, res) => {
+  const stage = findStage(parseInt(req.params.id));
+  if (!stage) return res.status(404).json({ error: 'مرحله پیدا نشد' });
+  res.json({ words: stage.words });
+});
+
+// Quick way to jump a tester's OWN account into a "mid-progress" state for QA — never
+// touches another account, and only ever used from inside the tester panel.
+app.post('/api/tester/grant-progress', testerRequired, async (req, res) => {
+  try {
+    const user = await users.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+    const nextUnlock = Math.min(STAGES.length, user.unlockedStage + 5);
+    const updated = await users.updateUser(user.id, {
+      coins: user.coins + 500, gems: (user.gems || 0) + 20, xp: user.xp + 200,
+      unlockedStage: nextUnlock
+    });
+    res.json({ user: publicUser(updated) });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'خطای سرور' }); }
+});
+
 app.post('/api/tester/bugs', testerRequired, async (req, res) => {
   const description = String((req.body && req.body.description) || '').slice(0, 1000).trim();
   if (!description) return res.status(400).json({ error: 'توضیح باگ خالیه' });

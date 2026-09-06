@@ -54,4 +54,11 @@ async function listForUser(userId, limit = 20) {
   return data || [];
 }
 
-module.exports = { createPending, attachTransId, findByTransId, markPaidIfPending, markFailed, listForUser };
+async function listAll(limit = 200) {
+  const { data, error } = await getClient().from('purchases').select('*')
+    .order('created_at', { ascending: false }).limit(limit);
+  if (error) throw error;
+  return data || [];
+}
+
+module.exports = { createPending, attachTransId, findByTransId, markPaidIfPending, markFailed, listForUser, listAll };
